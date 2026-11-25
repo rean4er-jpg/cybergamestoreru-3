@@ -1,0 +1,283 @@
+{
+  "entities": {
+    "Product": {
+      "title": "StoreProductRecord",
+      "description": "Custom or overridden digital game/subscription product managed from the CyberGameStore Admin Panel.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 80,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "sku": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "title": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 160
+        },
+        "platformGroup": {
+          "type": "string",
+          "enum": ["ps", "xbox"]
+        },
+        "platformLabel": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 60
+        },
+        "categoryType": {
+          "type": "string",
+          "enum": ["games", "subscriptions"]
+        },
+        "deliveryType": {
+          "type": "string",
+          "enum": ["account", "key", "subscription"]
+        },
+        "regionLabel": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 50
+        },
+        "genre": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 80
+        },
+        "brand": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "editionLabel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "language": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 100
+        },
+        "hasRussian": {
+          "type": "boolean"
+        },
+        "isPreorder": {
+          "type": "boolean"
+        },
+        "inStock": {
+          "type": "boolean"
+        },
+        "isHidden": {
+          "type": "boolean"
+        },
+        "priceRub": {
+          "type": "number"
+        },
+        "oldPriceRub": {
+          "type": "number"
+        },
+        "image": {
+          "type": "string",
+          "maxLength": 450000
+        },
+        "shortDescription": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "fullDescription": {
+          "type": "string",
+          "maxLength": 4000
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "sku",
+        "title",
+        "platformGroup",
+        "platformLabel",
+        "categoryType",
+        "deliveryType",
+        "regionLabel",
+        "genre",
+        "brand",
+        "editionLabel",
+        "language",
+        "hasRussian",
+        "isPreorder",
+        "inStock",
+        "isHidden",
+        "priceRub",
+        "oldPriceRub",
+        "image",
+        "shortDescription",
+        "fullDescription",
+        "createdBy",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Sale": {
+      "title": "SaleRecord",
+      "description": "Completed, pending, or refunded order record displayed in the Admin Sales Ledger and Monthly Revenue Chart.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 80,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "orderDate": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 10,
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        },
+        "productId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "productTitle": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 160
+        },
+        "platformGroup": {
+          "type": "string",
+          "enum": ["ps", "xbox"]
+        },
+        "categoryType": {
+          "type": "string",
+          "enum": ["games", "subscriptions"]
+        },
+        "quantity": {
+          "type": "number"
+        },
+        "unitPriceRub": {
+          "type": "number"
+        },
+        "totalRub": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["paid", "pending", "refunded", "cancelled"]
+        },
+        "channel": {
+          "type": "string",
+          "enum": ["site", "telegram", "avito", "wildberries"]
+        },
+        "paymentMethod": {
+          "type": "string",
+          "enum": ["sbp", "card", "transfer"]
+        },
+        "customerName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "customerContact": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 400
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "orderDate",
+        "productId",
+        "productTitle",
+        "platformGroup",
+        "categoryType",
+        "quantity",
+        "unitPriceRub",
+        "totalRub",
+        "status",
+        "channel",
+        "paymentMethod",
+        "customerName",
+        "customerContact",
+        "note",
+        "createdBy",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AdminUser": {
+      "title": "AdminUserRecord",
+      "description": "Authorized admin UID registry for RBAC verification.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 160
+        },
+        "role": {
+          "type": "string",
+          "enum": ["admin"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "role", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/products/{productId}": {
+      "schema": { "$ref": "#/entities/Product" },
+      "description": "Publicly readable catalog products managed exclusively by verified store administrators."
+    },
+    "/sales/{saleId}": {
+      "schema": { "$ref": "#/entities/Sale" },
+      "description": "Private sales ledger and revenue records accessible exclusively by verified store administrators."
+    },
+    "/admins/{adminUid}": {
+      "schema": { "$ref": "#/entities/AdminUser" },
+      "description": "Admin role registry used for database-backed RBAC checks."
+    }
+  }
+}
