@@ -485,7 +485,7 @@ export function CatalogImportModal({
                                       <ResilientImage
                                         src={item.draft.image}
                                         alt={item.draft.title}
-                                        className="w-full h-full object-cover"
+                                        className="w-full h-full"
                                       />
                                     </div>
                                     <div className="min-w-0">

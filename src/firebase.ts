@@ -1,20 +1,60 @@
 import { initializeApp } from 'firebase/app';
 import {
   getAuth,
+  getRedirectResult,
   GoogleAuthProvider,
   signInWithPopup,
+  signInWithRedirect,
   signOut,
   type User,
 } from 'firebase/auth';
-import { doc, getDoc, getDocFromServer, getFirestore } from 'firebase/firestore';
+import {
+  doc,
+  getDoc,
+  getDocFromServer,
+  getFirestore,
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
+  type Firestore,
+} from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 
 export const BOOTSTRAP_ADMIN_EMAIL = 'rean4er@gmail.com';
+export const BOOTSTRAP_ADMIN_EMAILS = [
+  'rean4er@gmail.com',
+  'cybergamestoreru@gmail.com',
+] as const;
+
+export function isBootstrapAdminEmail(email?: string | null): boolean {
+  if (!email) return false;
+  const normalized = email.trim().toLowerCase();
+  return (BOOTSTRAP_ADMIN_EMAILS as readonly string[]).includes(normalized);
+}
+
 export const FIRESTORE_PRICING_URL = 'https://firebase.google.com/pricing#cloud-firestore';
 export const FIRESTORE_CONSOLE_UPGRADE_URL = `https://console.firebase.google.com/project/${firebaseConfig.projectId}/firestore/databases/${firebaseConfig.firestoreDatabaseId}/data?openUpgradeDialog=true`;
+export const FIREBASE_AUTH_SETTINGS_URL = `https://console.firebase.google.com/project/${firebaseConfig.projectId}/authentication/settings`;
 
 const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+
+function createFirestoreDb(): Firestore {
+  try {
+    return initializeFirestore(
+      app,
+      {
+        localCache: persistentLocalCache({
+          tabManager: persistentMultipleTabManager(),
+        }),
+      },
+      firebaseConfig.firestoreDatabaseId
+    );
+  } catch {
+    return getFirestore(app, firebaseConfig.firestoreDatabaseId);
+  }
+}
+
+export const db = createFirestoreDb();
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: 'select_account' });
@@ -140,13 +180,27 @@ export async function signInWithGoogle(): Promise<User> {
   return result.user;
 }
 
+export async function signInWithGoogleRedirect(): Promise<void> {
+  await signInWithRedirect(auth, googleProvider);
+}
+
+export async function consumeGoogleRedirectResult(): Promise<User | null> {
+  try {
+    const result = await getRedirectResult(auth);
+    return result?.user ?? null;
+  } catch (err) {
+    console.warn('Redirect sign-in check:', err);
+    return null;
+  }
+}
+
 export async function signOutAdmin(): Promise<void> {
   await signOut(auth);
 }
 
 export async function checkIsAdminUser(user: User | null): Promise<boolean> {
   if (!user || !user.emailVerified) return false;
-  if (user.email?.toLowerCase() === BOOTSTRAP_ADMIN_EMAIL) return true;
+  if (isBootstrapAdminEmail(user.email)) return true;
   try {
     const adminSnap = await withTimeout(
       getDoc(doc(db, 'admins', user.uid)),

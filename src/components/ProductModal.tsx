@@ -16,6 +16,28 @@ interface ProductModalProps {
   onAddToCart: (product: StoreProduct, variant: ProductVariant) => void;
 }
 
+const TELEGRAM_LINK_URL = 'https://t.me/GyberGameStore';
+
+function renderTextWithTelegramLink(text: string) {
+  const parts = text.split(TELEGRAM_LINK_URL);
+  if (parts.length === 1) return text;
+  return parts.map((part, idx) => (
+    <span key={idx}>
+      {part}
+      {idx < parts.length - 1 && (
+        <a
+          href={TELEGRAM_LINK_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="font-semibold text-[#52c44c] underline hover:text-[#3d9c38]"
+        >
+          {TELEGRAM_LINK_URL}
+        </a>
+      )}
+    </span>
+  ));
+}
+
 export function ProductModal({
   product,
   allProducts,
@@ -104,14 +126,15 @@ export function ProductModal({
                   alt={product.title}
                   title={product.title}
                   fallbackTone={product.fallbackTone}
-                  className="w-full h-full object-cover"
+                  mode="contain"
+                  className="w-full h-full"
                 />
                 {hasDiscount ? (
-                  <span className="absolute top-3 left-3 px-2.5 py-1 text-xs font-bold text-black bg-[#52c44c] rounded-md tabular-nums">
+                  <span className="absolute top-3 left-3 z-10 px-2.5 py-1 text-xs font-bold text-black bg-[#52c44c] rounded-md tabular-nums">
                     Скидка -{selectedVariant.discountPercent}%
                   </span>
                 ) : product.isPreorder ? (
-                  <span className="absolute top-3 left-3 px-2.5 py-1 text-xs font-bold text-white bg-black/85 border border-neutral-700 rounded-md">
+                  <span className="absolute top-3 left-3 z-10 px-2.5 py-1 text-xs font-bold text-white bg-black/85 border border-neutral-700 rounded-md">
                     Предзаказ
                   </span>
                 ) : null}
@@ -145,7 +168,9 @@ export function ProductModal({
 
                 {activeTab === 'overview' ? (
                   <div className="space-y-4 text-sm leading-relaxed text-neutral-700">
-                    <p>{product.fullDescription}</p>
+                    <p className="whitespace-pre-line">
+                      {renderTextWithTelegramLink(product.fullDescription)}
+                    </p>
                     <div className="pt-3 border-t border-neutral-200 grid grid-cols-2 gap-3 text-xs">
                       <div>
                         <span className="text-neutral-500 block">Язык и локализация</span>
@@ -181,7 +206,7 @@ export function ProductModal({
                   <ol className="space-y-2.5 text-sm text-neutral-700 list-decimal list-inside">
                     {product.activationSteps.map((step, idx) => (
                       <li key={idx} className="leading-relaxed">
-                        {step}
+                        {renderTextWithTelegramLink(step)}
                       </li>
                     ))}
                   </ol>
@@ -308,10 +333,10 @@ export function ProductModal({
                 <ShieldCheck className="w-4 h-4 text-[#52c44c] shrink-0 mt-0.5" />
                 <span>
                   {product.deliveryType === 'key'
-                    ? 'Официальный цифровой ключ Xbox. Активируется на ваш личный аккаунт Microsoft навсегда.'
+                    ? 'Официальный цифровой ключ Xbox. Выдача и помощь с активацией в Telegram.'
                     : product.deliveryType === 'subscription'
-                      ? 'Готовый аккаунт с активной подпиской Xbox Game Pass Ultimate. Работает в России без VPN через Домашнюю консоль.'
-                      : 'Официальная покупка на ваш личный аккаунт за 5–15 минут. Если турецкого профиля ещё нет — бесплатно поможем создать.'}
+                      ? 'Оформляем подписку на ваш личный аккаунт или выдаём готовый профиль. Оформление за 5–15 минут через Telegram.'
+                      : 'Официальная покупка на ваш личный аккаунт за 5–15 минут через Telegram. Если турецкого профиля ещё нет — бесплатно поможем создать.'}
                 </span>
               </div>
             </div>

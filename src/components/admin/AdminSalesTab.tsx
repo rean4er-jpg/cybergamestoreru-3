@@ -1,10 +1,12 @@
 import { useMemo, useState } from 'react';
 import {
+  Bell,
   Download,
   Pencil,
   Plus,
   RefreshCw,
   Search,
+  Send,
   Trash2,
 } from 'lucide-react';
 import {
@@ -15,15 +17,31 @@ import {
   type SaleStatus,
 } from '../../data/adminCatalog';
 
+interface TelegramStatusInfo {
+  available: boolean;
+  hasBotToken: boolean;
+  configured: boolean;
+  chatCount: number;
+  hasOnlyBotSelfId: boolean;
+  notifyOnCreate: boolean;
+}
+
 interface AdminSalesTabProps {
   sales: SaleRecord[];
   syncingCheckout: boolean;
   syncNotice: string | null;
+  telegramStatus: TelegramStatusInfo | null;
+  testingTelegram: boolean;
+  detectingTelegram: boolean;
+  detectedTelegramChats: Array<{ id: string; label: string; type: string }>;
+  telegramNotice: { ok: boolean; text: string } | null;
   onAddSale: () => void;
   onEditSale: (sale: SaleRecord) => void;
   onUpdateStatus: (sale: SaleRecord, nextStatus: SaleStatus) => Promise<void>;
   onDeleteSale: (saleId: string) => Promise<void>;
   onSyncServerOrders: () => Promise<void>;
+  onTestTelegram: () => Promise<void>;
+  onDetectTelegramChats: () => Promise<void>;
 }
 
 const STATUS_LABELS: Record<SaleStatus, { label: string; colorClass: string }> = {
@@ -56,11 +74,18 @@ export function AdminSalesTab({
   sales,
   syncingCheckout,
   syncNotice,
+  telegramStatus,
+  testingTelegram,
+  detectingTelegram,
+  detectedTelegramChats,
+  telegramNotice,
   onAddSale,
   onEditSale,
   onUpdateStatus,
   onDeleteSale,
   onSyncServerOrders,
+  onTestTelegram,
+  onDetectTelegramChats,
 }: AdminSalesTabProps) {
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | SaleStatus>('all');
@@ -184,6 +209,131 @@ export function AdminSalesTab({
       {syncNotice && (
         <div className="px-4 py-2.5 rounded-lg bg-white border border-neutral-200 text-xs text-neutral-700">
           {syncNotice}
+        </div>
+      )}
+
+      {telegramStatus && (
+        <div className="bg-white border border-neutral-200 rounded-lg p-4 space-y-2.5">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-start gap-2.5">
+              <Bell
+                className={`w-4 h-4 shrink-0 mt-0.5 ${
+                  telegramStatus.configured ? 'text-[#52c44c]' : 'text-amber-600'
+                }`}
+              />
+              <div className="space-y-1 text-xs">
+                <div className="font-semibold text-neutral-900">
+                  Оповещения о покупках в Telegram:{' '}
+                  <span
+                    className={
+                      telegramStatus.configured ? 'text-emerald-700' : 'text-amber-700'
+                    }
+                  >
+                    {telegramStatus.configured
+                      ? `подключены (получателей: ${telegramStatus.chatCount})`
+                      : telegramStatus.hasOnlyBotSelfId
+                        ? 'указан ID самого бота вместо вашего личного ID'
+                        : telegramStatus.available
+                          ? 'не настроены'
+                          : 'доступны при запуске Node-сервера'}
+                  </span>
+                </div>
+                {telegramStatus.configured ? (
+                  <p className="text-neutral-600 leading-relaxed">
+                    Бот автоматически присылает заказ, сумму, контакты покупателя и состав корзины
+                    сразу после оплаты
+                    {telegramStatus.notifyOnCreate
+                      ? ' (а также при создании нового заказа).'
+                      : '.'}
+                  </p>
+                ) : telegramStatus.hasOnlyBotSelfId ? (
+                  <p className="text-neutral-600 leading-relaxed">
+                    В <code className="font-mono">TELEGRAM_CHAT_ID</code> сейчас вписан ID самого
+                    бота (число из начала токена), а бот не может писать сам себе. Откройте бота в
+                    Telegram, нажмите <code className="font-mono">/start</code> и нажмите «Найти
+                    мой Chat ID», затем впишите найденный ID в{' '}
+                    <code className="font-mono">TELEGRAM_CHAT_ID</code>.
+                  </p>
+                ) : telegramStatus.available ? (
+                  <p className="text-neutral-600 leading-relaxed">
+                    1) Создайте бота у <code className="font-mono">@BotFather</code> и задайте{' '}
+                    <code className="font-mono">TELEGRAM_BOT_TOKEN</code>. 2) Нажмите{' '}
+                    <code className="font-mono">/start</code> в своём боте и узнайте ваш ID через{' '}
+                    <code className="font-mono">@userinfobot</code> (или кнопку «Найти мой Chat
+                    ID»). 3) Задайте <code className="font-mono">TELEGRAM_CHAT_ID</code> в секретах
+                    сервера.
+                  </p>
+                ) : (
+                  <p className="text-neutral-600 leading-relaxed">
+                    На статическом хостинге без backend (/api) токен бота нельзя хранить в
+                    браузере. Запустите сайт с Node-сервером и задайте{' '}
+                    <code className="font-mono">TELEGRAM_BOT_TOKEN</code> и{' '}
+                    <code className="font-mono">TELEGRAM_CHAT_ID</code>.
+                  </p>
+                )}
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              {telegramStatus.hasBotToken && !telegramStatus.configured && (
+                <button
+                  type="button"
+                  disabled={detectingTelegram}
+                  onClick={() => void onDetectTelegramChats()}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-[#111111] hover:bg-neutral-800 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <Search className="w-3.5 h-3.5 text-[#52c44c]" />
+                  <span>{detectingTelegram ? 'Поиск...' : 'Найти мой Chat ID'}</span>
+                </button>
+              )}
+
+              {telegramStatus.configured && (
+                <button
+                  type="button"
+                  disabled={testingTelegram}
+                  onClick={() => void onTestTelegram()}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-[#111111] hover:bg-neutral-800 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <Send className="w-3.5 h-3.5 text-[#52c44c]" />
+                  <span>{testingTelegram ? 'Отправка...' : 'Отправить тест'}</span>
+                </button>
+              )}
+            </div>
+          </div>
+
+          {detectedTelegramChats.length > 0 && (
+            <div className="px-3 py-2.5 rounded-md bg-neutral-50 border border-neutral-200 space-y-1.5 text-xs">
+              <div className="font-semibold text-neutral-800">
+                Найденные чаты (вставьте нужное значение в секрет{' '}
+                <code className="font-mono">TELEGRAM_CHAT_ID</code>):
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {detectedTelegramChats.map((chat) => (
+                  <div
+                    key={chat.id}
+                    className="inline-flex items-center gap-2 px-2.5 py-1 rounded bg-white border border-neutral-200"
+                  >
+                    <span className="text-neutral-700">{chat.label}:</span>
+                    <code className="font-mono font-bold text-neutral-900 select-all">
+                      {chat.id}
+                    </code>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {telegramNotice && (
+            <div
+              className={`px-3 py-2 rounded-md text-xs border ${
+                telegramNotice.ok
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                  : 'bg-red-50 border-red-200 text-red-700'
+              }`}
+            >
+              {telegramNotice.text}
+            </div>
+          )}
         </div>
       )}
 

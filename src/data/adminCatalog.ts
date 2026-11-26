@@ -68,6 +68,118 @@ export interface CatalogStatsSummary {
 }
 
 export const BUILTIN_PRODUCT_IDS = new Set(STORE_PRODUCTS.map((p) => p.id));
+export const DEFAULT_DELTA_CUTOFF_ISO = '2026-11-26T01:00:00.000Z';
+
+export interface StaticCatalogManifest {
+  version: number;
+  deltaCutoffIso: string;
+  totalExtraCount: number;
+  descriptions: string[];
+  parts: string[];
+}
+
+interface CompactStaticCatalogItem extends Omit<RawCatalogItem, 'description'> {
+  description?: string;
+  dIdx?: number;
+}
+
+export interface LoadedStaticExtraCatalog {
+  products: StoreProduct[];
+  idSet: Set<string>;
+  deltaCutoffIso: string;
+}
+
+let cachedStaticExtraPromise: Promise<LoadedStaticExtraCatalog> | null = null;
+
+/**
+ * Loads the pre-built 27,020-item static catalog chunks from /catalog-data/
+ * in parallel with 0 Firestore reads. Cached per session.
+ */
+export function loadStaticExtraCatalog(): Promise<LoadedStaticExtraCatalog> {
+  if (cachedStaticExtraPromise) return cachedStaticExtraPromise;
+
+  cachedStaticExtraPromise = (async () => {
+    try {
+      const manifestRes = await fetch('/catalog-data/manifest.json');
+      const ct = manifestRes.headers.get('content-type') || '';
+      if (!manifestRes.ok || !ct.includes('application/json')) {
+        return {
+          products: [],
+          idSet: new Set<string>(),
+          deltaCutoffIso: DEFAULT_DELTA_CUTOFF_ISO,
+        };
+      }
+
+      const manifest = (await manifestRes.json()) as StaticCatalogManifest;
+      const parts = Array.isArray(manifest.parts) ? manifest.parts : [];
+      const descriptions = Array.isArray(manifest.descriptions) ? manifest.descriptions : [];
+      const deltaCutoffIso =
+        typeof manifest.deltaCutoffIso === 'string' && manifest.deltaCutoffIso
+          ? manifest.deltaCutoffIso
+          : DEFAULT_DELTA_CUTOFF_ISO;
+
+      const partArrays = await Promise.all(
+        parts.map(async (partUrl) => {
+          try {
+            const res = await fetch(partUrl);
+            if (!res.ok) return [] as CompactStaticCatalogItem[];
+            const parsed = (await res.json()) as unknown;
+            return Array.isArray(parsed) ? (parsed as CompactStaticCatalogItem[]) : [];
+          } catch {
+            return [] as CompactStaticCatalogItem[];
+          }
+        })
+      );
+
+      const products: StoreProduct[] = [];
+      const idSet = new Set<string>();
+
+      for (const chunk of partArrays) {
+        for (const compact of chunk) {
+          if (!compact || !compact.id || BUILTIN_PRODUCT_IDS.has(compact.id) || idSet.has(compact.id)) {
+            continue;
+          }
+          const description =
+            typeof compact.description === 'string'
+              ? compact.description
+              : typeof compact.dIdx === 'number'
+                ? descriptions[compact.dIdx] || ''
+                : '';
+
+          const rawItem: RawCatalogItem = {
+            id: compact.id,
+            sku: compact.sku,
+            title: compact.title,
+            platform: compact.platform,
+            region: compact.region,
+            hasRussian: compact.hasRussian,
+            category: compact.category,
+            brand: compact.brand,
+            price: compact.price,
+            oldPrice: compact.oldPrice,
+            image: compact.image,
+            description,
+          };
+
+          idSet.add(rawItem.id);
+          products.push(mapRawToProduct(rawItem));
+        }
+      }
+
+      products.sort((a, b) => b.featuredScore - a.featuredScore);
+
+      return { products, idSet, deltaCutoffIso };
+    } catch {
+      return {
+        products: [],
+        idSet: new Set<string>(),
+        deltaCutoffIso: DEFAULT_DELTA_CUTOFF_ISO,
+      };
+    }
+  })();
+
+  return cachedStaticExtraPromise;
+}
 
 export const PRESET_ARTWORKS: { label: string; src: string }[] = [
   { label: 'PlayStation Экшен', src: '/src/assets/images/catalog_ps_action_1795245737849.jpg' },
@@ -95,7 +207,7 @@ function buildDeliveryLabel(
   platformGroup: 'ps' | 'xbox',
   deliveryType: 'account' | 'key' | 'subscription'
 ): string {
-  if (deliveryType === 'subscription') return 'Готовый аккаунт с подпиской';
+  if (deliveryType === 'subscription') return 'На ваш аккаунт или готовый профиль';
   if (deliveryType === 'key') return 'Ключ на ваш аккаунт';
   return platformGroup === 'ps' ? 'Покупка на турецкий аккаунт' : 'Покупка на любой аккаунт';
 }
@@ -105,7 +217,7 @@ function buildDeliveryTimeNote(
   deliveryType: 'account' | 'key' | 'subscription'
 ): string {
   if (deliveryType === 'key') return 'Цифровой ключ · 5–15 мин';
-  if (deliveryType === 'subscription') return 'Выдача аккаунта с подпиской · 5–15 мин';
+  if (deliveryType === 'subscription') return 'Оформление подписки · 5–15 мин';
   return platformGroup === 'ps'
     ? 'Покупка в турецком PS Store · 5–15 мин'
     : 'Оформление на аккаунт Xbox · 5–15 мин';
@@ -116,29 +228,37 @@ function buildActivationSteps(
   deliveryType: 'account' | 'key' | 'subscription'
 ): string[] {
   if (deliveryType === 'subscription') {
+    const accountTarget =
+      platformGroup === 'ps'
+        ? 'Мы можем приобрести и активировать подписку PlayStation Plus прямо на ваш личный аккаунт PlayStation либо выдать новый готовый аккаунт по вашему выбору.'
+        : 'Мы можем приобрести и активировать подписку Xbox Game Pass Ultimate прямо на ваш личный аккаунт Microsoft либо выдать новый готовый аккаунт по вашему выбору.';
+    const playStep =
+      platformGroup === 'ps'
+        ? 'Если выбран готовый аккаунт — включите «Общий доступ к консоли» на PS4/PS5 и играйте со своего основного профиля (все сохранения и трофеи сохраняются).'
+        : 'После активации используйте подписку на своём аккаунте или включите «Домашнюю консоль» на Xbox и играйте с основного профиля без VPN.';
     return [
-      'Оформите заказ в корзине и оставьте Telegram или Email для получения данных.',
-      'Мы выдаём готовый аккаунт с активной подпиской Xbox Game Pass Ultimate — данные от вашего личного профиля не требуются.',
-      'Войдите в выданный профиль на консоли Xbox, включите функцию «Домашняя консоль» и играйте со своего основного российского аккаунта без VPN.',
+      'Оформите заказ в корзине и укажите ваш Telegram (@username) или напишите сразу менеджеру: https://t.me/GyberGameStore.',
+      accountTarget,
+      playStep,
     ];
   }
   if (deliveryType === 'key') {
     return [
-      'Оформите заказ в корзине и укажите контакт для связи (Telegram или Email).',
-      'Менеджер отправит официальный цифровой ключ активации Xbox и пошаговую инструкцию (или поможет активировать ключ на ваш аккаунт).',
+      'Оформите заказ в корзине и укажите ваш Telegram (@username) или напишите менеджеру: https://t.me/GyberGameStore.',
+      'Менеджер отправит официальный цифровой ключ активации Xbox в Telegram и при необходимости поможет активировать ключ на ваш аккаунт.',
       'Игра закрепляется за вашим личным аккаунтом Microsoft навсегда и доступна для загрузки с консоли.',
     ];
   }
   if (platformGroup === 'ps') {
     return [
-      'При оформлении заказа укажите данные вашего турецкого аккаунта PlayStation или выберите бесплатную помощь с созданием нового профиля.',
-      'Мы официально оплачиваем игру в турецком PlayStation Store за 5–15 минут и отправляем подтверждение покупки.',
+      'При оформлении заказа укажите ваш Telegram (@username) или напишите менеджеру: https://t.me/GyberGameStore. Если турецкого аккаунта PlayStation ещё нет — бесплатно поможем создать.',
+      'Мы официально оплачиваем игру в турецком PlayStation Store за 5–15 минут и отправляем подтверждение покупки в Telegram.',
       'Включите «Общий доступ к консоли» на PS5/PS4 и играйте со своего основного российского аккаунта со всеми трофеями.',
     ];
   }
   return [
-    'Оформите заказ в корзине и укажите контакт для связи (Telegram или Email).',
-    'Мы официально приобретаем игру на ваш аккаунт Microsoft (подходит любой аккаунт Xbox) за 5–15 минут.',
+    'Оформите заказ в корзине и укажите ваш Telegram (@username) или напишите менеджеру: https://t.me/GyberGameStore.',
+    'Мы официально приобретаем игру на ваш аккаунт Microsoft (подходит любой аккаунт Xbox) за 5–15 минут и сообщаем о готовности в Telegram.',
     'После подтверждения скачайте игру из вашей библиотеки на консоль и играйте без ограничений.',
   ];
 }
@@ -300,14 +420,22 @@ export function combineProductOverrides(
 
 export function mergeCatalogProducts(
   firestoreDocs: FirestoreProductDoc[],
-  includeHidden = false
+  includeHidden = false,
+  extraStaticProducts: StoreProduct[] = [],
+  extraStaticIdSet?: Set<string>
 ): StoreProduct[] {
+  const staticIds =
+    extraStaticIdSet ??
+    (extraStaticProducts.length > 0
+      ? new Set(extraStaticProducts.map((p) => p.id))
+      : null);
+
   const overrideMap = new Map<string, FirestoreProductDoc>();
   const customOnly: FirestoreProductDoc[] = [];
 
   for (const docData of firestoreDocs) {
     overrideMap.set(docData.id, docData);
-    if (!BUILTIN_PRODUCT_IDS.has(docData.id)) {
+    if (!BUILTIN_PRODUCT_IDS.has(docData.id) && !(staticIds && staticIds.has(docData.id))) {
       customOnly.push(docData);
     }
   }
@@ -336,19 +464,68 @@ export function mergeCatalogProducts(
     }
   }
 
-  return [...mergedCustom, ...mergedBuiltin];
+  if (extraStaticProducts.length === 0) {
+    return [...mergedCustom, ...mergedBuiltin];
+  }
+
+  const mergedExtraStatic: StoreProduct[] = [];
+  for (const base of extraStaticProducts) {
+    const override = overrideMap.get(base.id);
+    if (override) {
+      if (!includeHidden && override.isHidden) continue;
+      mergedExtraStatic.push(firestoreDocToStoreProduct(override, base));
+    } else {
+      mergedExtraStatic.push(base);
+    }
+  }
+
+  // Both mergedBuiltin and mergedExtraStatic are already ordered by featuredScore descending.
+  // Two-pointer O(N) merge puts top-scored extra items (like PS Plus subscriptions) onto Page 1.
+  const rankedCatalog: StoreProduct[] = new Array(mergedBuiltin.length + mergedExtraStatic.length);
+  let i = 0;
+  let j = 0;
+  let k = 0;
+  while (i < mergedBuiltin.length && j < mergedExtraStatic.length) {
+    if (mergedBuiltin[i].featuredScore >= mergedExtraStatic[j].featuredScore) {
+      rankedCatalog[k++] = mergedBuiltin[i++];
+    } else {
+      rankedCatalog[k++] = mergedExtraStatic[j++];
+    }
+  }
+  while (i < mergedBuiltin.length) rankedCatalog[k++] = mergedBuiltin[i++];
+  while (j < mergedExtraStatic.length) rankedCatalog[k++] = mergedExtraStatic[j++];
+
+  return [...mergedCustom, ...rankedCatalog];
 }
 
 export function computeCatalogStats(products: StoreProduct[]): CatalogStatsSummary {
+  let xboxGames = 0;
+  let psGames = 0;
+  let subscriptions = 0;
+  let keys = 0;
+  let preorders = 0;
+  let withRussian = 0;
+  let discounted = 0;
+
+  for (const p of products) {
+    if (p.platformGroup === 'xbox' && p.categoryType === 'games') xboxGames++;
+    if (p.platformGroup === 'ps') psGames++;
+    if (p.categoryType === 'subscriptions') subscriptions++;
+    if (p.deliveryType === 'key') keys++;
+    if (p.isPreorder) preorders++;
+    if (p.hasRussian) withRussian++;
+    if (p.variants[0].discountPercent > 0) discounted++;
+  }
+
   return {
     total: products.length,
-    xboxGames: products.filter((p) => p.platformGroup === 'xbox' && p.categoryType === 'games').length,
-    psGames: products.filter((p) => p.platformGroup === 'ps').length,
-    subscriptions: products.filter((p) => p.categoryType === 'subscriptions').length,
-    keys: products.filter((p) => p.deliveryType === 'key').length,
-    preorders: products.filter((p) => p.isPreorder).length,
-    withRussian: products.filter((p) => p.hasRussian).length,
-    discounted: products.filter((p) => p.variants[0].discountPercent > 0).length,
+    xboxGames,
+    psGames,
+    subscriptions,
+    keys,
+    preorders,
+    withRussian,
+    discounted,
   };
 }
 

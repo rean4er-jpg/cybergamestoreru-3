@@ -15,6 +15,8 @@ import {
   AlertTriangle,
   ArrowLeft,
   BarChart3,
+  Copy,
+  Check,
   ExternalLink,
   FileJson,
   Loader2,
@@ -30,15 +32,18 @@ import {
 } from 'lucide-react';
 import {
   auth,
-  BOOTSTRAP_ADMIN_EMAIL,
   checkIsAdminUser,
+  consumeGoogleRedirectResult,
   db,
+  FIREBASE_AUTH_SETTINGS_URL,
   FIRESTORE_CONSOLE_UPGRADE_URL,
   FIRESTORE_PRICING_URL,
   handleFirestoreError,
+  isBootstrapAdminEmail,
   isQuotaExceededError,
   OperationType,
   signInWithGoogle,
+  signInWithGoogleRedirect,
   signOutAdmin,
   withTimeout,
 } from '../../firebase';
@@ -64,6 +69,8 @@ import { CatalogImportModal } from './CatalogImportModal';
 type AdminTab = 'overview' | 'products' | 'sales';
 
 interface AdminPanelProps {
+  staticExtraProducts: StoreProduct[];
+  staticExtraIdSet: Set<string>;
   firestoreProducts: FirestoreProductDoc[];
   serverProducts: FirestoreProductDoc[];
   onRefreshServerProducts: () => Promise<void>;
@@ -88,7 +95,32 @@ interface ServerCheckoutOrder {
   }>;
 }
 
+async function fetchOptionalJsonApi<T>(
+  url: string,
+  init?: RequestInit
+): Promise<{ available: boolean; ok: boolean; status: number; data?: T; error?: string }> {
+  try {
+    const res = await fetch(url, init);
+    const contentType = res.headers.get('content-type') || '';
+    if (res.status === 404 || res.status === 405 || !contentType.includes('application/json')) {
+      return { available: false, ok: false, status: res.status };
+    }
+    const data = (await res.json().catch(() => ({}))) as T & { error?: string };
+    return {
+      available: true,
+      ok: res.ok,
+      status: res.status,
+      data,
+      error: typeof data?.error === 'string' ? data.error : undefined,
+    };
+  } catch {
+    return { available: false, ok: false, status: 0 };
+  }
+}
+
 export function AdminPanel({
+  staticExtraProducts,
+  staticExtraIdSet,
   firestoreProducts,
   serverProducts,
   onRefreshServerProducts,
@@ -98,6 +130,8 @@ export function AdminPanel({
   const [authReady, setAuthReady] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [authErrorKind, setAuthErrorKind] = useState<'generic' | 'unauthorized-domain' | 'popup-blocked'>('generic');
+  const [copiedDomain, setCopiedDomain] = useState(false);
   const [signingIn, setSigningIn] = useState(false);
 
   const [activeTab, setActiveTab] = useState<AdminTab>('overview');
@@ -121,6 +155,20 @@ export function AdminPanel({
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [syncingCheckout, setSyncingCheckout] = useState(false);
   const [syncNotice, setSyncNotice] = useState<string | null>(null);
+  const [telegramStatus, setTelegramStatus] = useState<{
+    available: boolean;
+    hasBotToken: boolean;
+    configured: boolean;
+    chatCount: number;
+    hasOnlyBotSelfId: boolean;
+    notifyOnCreate: boolean;
+  } | null>(null);
+  const [testingTelegram, setTestingTelegram] = useState(false);
+  const [detectingTelegram, setDetectingTelegram] = useState(false);
+  const [detectedTelegramChats, setDetectedTelegramChats] = useState<
+    Array<{ id: string; label: string; type: string }>
+  >([]);
+  const [telegramNotice, setTelegramNotice] = useState<{ ok: boolean; text: string } | null>(null);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
@@ -130,6 +178,7 @@ export function AdminPanel({
   };
 
   useEffect(() => {
+    void consumeGoogleRedirectResult();
     const unsubscribe = onAuthStateChanged(auth, async (nextUser) => {
       setUser(nextUser);
       if (nextUser) {
@@ -143,18 +192,20 @@ export function AdminPanel({
     return () => unsubscribe();
   }, []);
 
-  // Load sales from server store + Firestore listener with quota/timeout failsafe
+  // Load sales from server store (if running) + Firestore listener with quota/timeout failsafe
   useEffect(() => {
     if (!authReady || !user || !isAdmin) {
       setFirestoreSales([]);
       setServerSales([]);
       setSalesLoaded(false);
+      setTelegramStatus(null);
       return;
     }
 
     let cancelled = false;
     let serverReady = false;
     let firestoreReady = false;
+    let serverAvailable = false;
     let latestServerCount = 0;
     let latestFirestoreCount = 0;
 
@@ -164,36 +215,56 @@ export function AdminPanel({
 
       seededRef.current = true;
       const initialRows = buildInitialMonthlySales(user.uid);
+
+      // Seed to Firestore first so static hosting & all domains receive initial analytics
       try {
-        const idToken = await user.getIdToken();
-        const res = await fetch('/api/admin/sales/batch', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${idToken}`,
-          },
-          body: JSON.stringify({ items: initialRows }),
-        });
-        if (res.ok && !cancelled) {
-          const data = (await res.json()) as { sales?: SaleRecord[] };
-          if (Array.isArray(data.sales)) {
-            setServerSales(data.sales);
-          }
+        const batch = writeBatch(db);
+        for (const item of initialRows) {
+          batch.set(doc(db, 'sales', item.id), {
+            ...item,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
         }
-      } catch {
-        // Non-fatal: admin can still create sales manually
+        await withTimeout(batch.commit(), 8000);
+      } catch (err) {
+        if (isQuotaExceededError(err)) {
+          setFirestoreQuotaExceeded(true);
+        }
+      }
+
+      if (serverAvailable && !cancelled) {
+        try {
+          const idToken = await user.getIdToken();
+          const result = await fetchOptionalJsonApi<{ sales?: SaleRecord[] }>(
+            '/api/admin/sales/batch',
+            {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${idToken}`,
+              },
+              body: JSON.stringify({ items: initialRows }),
+            }
+          );
+          if (result.ok && Array.isArray(result.data?.sales) && !cancelled) {
+            setServerSales(result.data.sales);
+          }
+        } catch {
+          // Non-fatal
+        }
       }
     };
 
     const loadServerSales = async () => {
       try {
         const idToken = await user.getIdToken();
-        const res = await fetch('/api/admin/sales', {
+        const result = await fetchOptionalJsonApi<{ sales?: SaleRecord[] }>('/api/admin/sales', {
           headers: { Authorization: `Bearer ${idToken}` },
         });
-        if (res.ok && !cancelled) {
-          const data = (await res.json()) as { sales?: SaleRecord[] };
-          const rows = Array.isArray(data.sales) ? data.sales : [];
+        serverAvailable = result.available;
+        if (result.ok && !cancelled) {
+          const rows = Array.isArray(result.data?.sales) ? result.data.sales : [];
           latestServerCount = rows.length;
           setServerSales(rows);
         }
@@ -208,7 +279,44 @@ export function AdminPanel({
       }
     };
 
+    const loadTelegramStatus = async () => {
+      try {
+        const idToken = await user.getIdToken();
+        const res = await fetchOptionalJsonApi<{
+          hasBotToken?: boolean;
+          configured?: boolean;
+          chatCount?: number;
+          hasOnlyBotSelfId?: boolean;
+          notifyOnCreate?: boolean;
+        }>('/api/admin/telegram/status', {
+          headers: { Authorization: `Bearer ${idToken}` },
+        });
+        if (!cancelled) {
+          setTelegramStatus({
+            available: res.available,
+            hasBotToken: Boolean(res.ok && res.data?.hasBotToken),
+            configured: Boolean(res.ok && res.data?.configured),
+            chatCount: typeof res.data?.chatCount === 'number' ? res.data.chatCount : 0,
+            hasOnlyBotSelfId: Boolean(res.ok && res.data?.hasOnlyBotSelfId),
+            notifyOnCreate: Boolean(res.data?.notifyOnCreate),
+          });
+        }
+      } catch {
+        if (!cancelled) {
+          setTelegramStatus({
+            available: false,
+            hasBotToken: false,
+            configured: false,
+            chatCount: 0,
+            hasOnlyBotSelfId: false,
+            notifyOnCreate: false,
+          });
+        }
+      }
+    };
+
     void loadServerSales();
+    void loadTelegramStatus();
 
     // Failsafe so Firestore backoff can never stall dashboard loading
     const failsafeTimer = window.setTimeout(() => {
@@ -219,7 +327,7 @@ export function AdminPanel({
       }
     }, 3500);
 
-    const isBootstrap = user.email?.toLowerCase() === BOOTSTRAP_ADMIN_EMAIL;
+    const isBootstrap = isBootstrapAdminEmail(user.email);
     const salesRef = isBootstrap
       ? collection(db, 'sales')
       : query(collection(db, 'sales'), where('createdBy', '==', user.uid));
@@ -255,6 +363,24 @@ export function AdminPanel({
     };
   }, [authReady, user, isAdmin]);
 
+  useEffect(() => {
+    if (!authReady || !user || !isAdmin) return;
+    if (activeTab !== 'overview' && activeTab !== 'sales') return;
+    let cancelled = false;
+    void user.getIdToken().then((idToken) =>
+      fetchOptionalJsonApi<{ sales?: SaleRecord[] }>('/api/admin/sales', {
+        headers: { Authorization: `Bearer ${idToken}` },
+      }).then((result) => {
+        if (!cancelled && result.ok && Array.isArray(result.data?.sales)) {
+          setServerSales(result.data.sales);
+        }
+      })
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, authReady, user, isAdmin]);
+
   const sales = useMemo(() => {
     const byId = new Map<string, SaleRecord>();
     for (const s of firestoreSales) {
@@ -283,8 +409,14 @@ export function AdminPanel({
   }, [combinedOverrides]);
 
   const allAdminProducts = useMemo(
-    () => mergeCatalogProducts(combinedOverrides, true),
-    [combinedOverrides]
+    () =>
+      mergeCatalogProducts(
+        combinedOverrides,
+        true,
+        staticExtraProducts,
+        staticExtraIdSet
+      ),
+    [combinedOverrides, staticExtraProducts, staticExtraIdSet]
   );
 
   const existingCatalogIdSet = useMemo(
@@ -292,23 +424,83 @@ export function AdminPanel({
     [allAdminProducts]
   );
 
-  const activeCatalogCount = useMemo(
-    () => mergeCatalogProducts(combinedOverrides, false).length,
-    [combinedOverrides]
-  );
+  const activeCatalogCount = useMemo(() => {
+    let active = 0;
+    for (const p of allAdminProducts) {
+      if (!overrideMap.get(p.id)?.isHidden) active++;
+    }
+    return active;
+  }, [allAdminProducts, overrideMap]);
 
   const handleGoogleSignIn = async () => {
     setAuthError(null);
+    setAuthErrorKind('generic');
     setSigningIn(true);
     try {
       await signInWithGoogle();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Не удалось выполнить вход.';
-      if (!msg.includes('popup-closed-by-user')) {
-        setAuthError('Ошибка входа через Google. Попробуйте ещё раз.');
+      const code =
+        typeof err === 'object' && err !== null && 'code' in err
+          ? String((err as { code?: unknown }).code || '')
+          : '';
+      const msg = err instanceof Error ? err.message : String(err);
+
+      if (code === 'auth/popup-closed-by-user' || msg.includes('popup-closed-by-user')) {
+        return;
       }
+
+      if (
+        code === 'auth/unauthorized-domain' ||
+        msg.includes('unauthorized-domain')
+      ) {
+        setAuthErrorKind('unauthorized-domain');
+        setAuthError(
+          `Домен «${window.location.hostname}» не добавлен в список разрешённых доменов Firebase Authentication.`
+        );
+        return;
+      }
+
+      if (
+        code === 'auth/popup-blocked' ||
+        code === 'auth/cancelled-popup-request' ||
+        code === 'auth/operation-not-supported-in-this-environment' ||
+        msg.includes('popup-blocked')
+      ) {
+        setAuthErrorKind('popup-blocked');
+        setAuthError(
+          'Браузер заблокировал всплывающее окно Google. Разрешите всплывающие окна или используйте вход через перенаправление.'
+        );
+        return;
+      }
+
+      setAuthError(
+        code
+          ? `Ошибка входа через Google (${code}). Попробуйте ещё раз.`
+          : 'Ошибка входа через Google. Попробуйте ещё раз.'
+      );
     } finally {
       setSigningIn(false);
+    }
+  };
+
+  const handleGoogleRedirectSignIn = async () => {
+    setAuthError(null);
+    setSigningIn(true);
+    try {
+      await signInWithGoogleRedirect();
+    } catch {
+      setSigningIn(false);
+      setAuthError('Не удалось запустить перенаправление Google. Попробуйте обычный вход.');
+    }
+  };
+
+  const handleCopyHostname = async () => {
+    try {
+      await navigator.clipboard.writeText(window.location.hostname);
+      setCopiedDomain(true);
+      window.setTimeout(() => setCopiedDomain(false), 2500);
+    } catch {
+      // Ignore clipboard failures
     }
   };
 
@@ -316,7 +508,39 @@ export function AdminPanel({
     if (!user) return;
     const existing = overrideMap.get(draft.id);
     const idToken = await user.getIdToken();
-    const res = await fetch('/api/admin/catalog/item', {
+    let savedInFirestore = false;
+    let quotaHit = false;
+
+    if (!firestoreQuotaExceeded) {
+      try {
+        await withTimeout(
+          setDoc(doc(db, 'products', draft.id), {
+            ...draft,
+            createdBy: existing?.createdBy || user.uid,
+            createdAt: existing?.createdAt || serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          }),
+          12000
+        );
+        savedInFirestore = true;
+      } catch (error) {
+        if (isQuotaExceededError(error)) {
+          quotaHit = true;
+          setFirestoreQuotaExceeded(true);
+        } else {
+          handleFirestoreError(
+            error,
+            existing ? OperationType.UPDATE : OperationType.CREATE,
+            `products/${draft.id}`
+          );
+        }
+      }
+    } else {
+      quotaHit = true;
+    }
+
+    // Also mirror to Express server if available (silently skipped on static hosting)
+    const serverRes = await fetchOptionalJsonApi<{ ok?: boolean }>('/api/admin/catalog/item', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -324,12 +548,26 @@ export function AdminPanel({
       },
       body: JSON.stringify(draft),
     });
-    if (!res.ok) {
-      const body = (await res.json().catch(() => ({}))) as { error?: string };
-      throw new Error(body.error || 'Не удалось сохранить товар на сервере.');
+
+    if (serverRes.available && !serverRes.ok) {
+      throw new Error(serverRes.error || 'Не удалось сохранить товар на сервере.');
     }
-    await onRefreshServerProducts();
-    showToast(existing ? `Товар «${draft.title}» обновлён` : `Товар «${draft.title}» добавлен на витрину`);
+    if (serverRes.ok) {
+      await onRefreshServerProducts();
+    }
+
+    if (!savedInFirestore && !serverRes.ok) {
+      if (quotaHit) {
+        throw new Error(
+          'Исчерпана дневная квота записей Firebase Firestore. Лимит обновится завтра — или увеличьте тариф базы данных в консоли Firebase.'
+        );
+      }
+      throw new Error('Не удалось сохранить товар.');
+    }
+
+    showToast(
+      existing ? `Товар «${draft.title}» обновлён` : `Товар «${draft.title}» добавлен на витрину`
+    );
   };
 
   const handleImportProductsBatch = async (
@@ -338,31 +576,76 @@ export function AdminPanel({
   ) => {
     if (!user || drafts.length === 0) return;
     const idToken = await user.getIdToken();
-    const CHUNK_SIZE = 1000;
+
+    // Probe whether Express backend exists (true in AI Studio / Node server, false on static hosting)
+    const healthProbe = await fetchOptionalJsonApi<{ ok?: boolean }>('/api/health');
+    const hasServerApi = healthProbe.available && healthProbe.ok;
+
+    // For large catalogs on Node server, route via server to protect Firestore daily Spark quota.
+    // For static hosting OR <= 450 items, write directly to Firestore so products appear everywhere.
+    const shouldWriteFirestore = !hasServerApi || (drafts.length <= 450 && !firestoreQuotaExceeded);
     let completed = 0;
+    let quotaHit = false;
 
-    for (let i = 0; i < drafts.length; i += CHUNK_SIZE) {
-      const chunk = drafts.slice(i, i + CHUNK_SIZE);
-      const isLastChunk = i + CHUNK_SIZE >= drafts.length;
-      const res = await fetch('/api/admin/catalog/import', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${idToken}`,
-        },
-        body: JSON.stringify({ items: chunk, flush: isLastChunk }),
-      });
-
-      if (!res.ok) {
-        const body = (await res.json().catch(() => ({}))) as { error?: string };
-        throw new Error(body.error || 'Ошибка сервера при импорте каталога.');
+    if (shouldWriteFirestore) {
+      const FS_CHUNK = 150;
+      for (let i = 0; i < drafts.length; i += FS_CHUNK) {
+        const chunk = drafts.slice(i, i + FS_CHUNK);
+        const batch = writeBatch(db);
+        for (const draft of chunk) {
+          const existing = overrideMap.get(draft.id);
+          batch.set(doc(db, 'products', draft.id), {
+            ...draft,
+            createdBy: existing?.createdBy || user.uid,
+            createdAt: existing?.createdAt || serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+        try {
+          await withTimeout(batch.commit(), 15000);
+          completed += chunk.length;
+          onProgress(completed, drafts.length);
+        } catch (error) {
+          if (isQuotaExceededError(error)) {
+            quotaHit = true;
+            setFirestoreQuotaExceeded(true);
+            break;
+          }
+          handleFirestoreError(error, OperationType.WRITE, 'products');
+        }
       }
-
-      completed += chunk.length;
-      onProgress(completed, drafts.length);
     }
 
-    await onRefreshServerProducts();
+    if (hasServerApi) {
+      const SERVER_CHUNK = 1000;
+      for (let i = 0; i < drafts.length; i += SERVER_CHUNK) {
+        const chunk = drafts.slice(i, i + SERVER_CHUNK);
+        const isLastChunk = i + SERVER_CHUNK >= drafts.length;
+        const serverRes = await fetchOptionalJsonApi<{ ok?: boolean }>('/api/admin/catalog/import', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${idToken}`,
+          },
+          body: JSON.stringify({ items: chunk, flush: isLastChunk }),
+        });
+
+        if (!serverRes.ok) {
+          throw new Error(serverRes.error || 'Ошибка сервера при импорте каталога.');
+        }
+
+        if (!shouldWriteFirestore || quotaHit) {
+          completed = Math.max(completed, Math.min(drafts.length, i + chunk.length));
+          onProgress(completed, drafts.length);
+        }
+      }
+      await onRefreshServerProducts();
+    } else if (quotaHit && completed < drafts.length) {
+      throw new Error(
+        `Загружено в Firestore: ${completed} из ${drafts.length}. Далее исчерпана дневная квота бесплатной базы Firebase Firestore (сбросится завтра).`
+      );
+    }
+
     showToast(`Импортировано товаров из JSON: ${drafts.length.toLocaleString('ru-RU')}`);
   };
 
@@ -388,33 +671,48 @@ export function AdminPanel({
   };
 
   const handleDeleteCustomProduct = async (productId: string) => {
-    if (!user || BUILTIN_PRODUCT_IDS.has(productId)) return;
+    if (!user || BUILTIN_PRODUCT_IDS.has(productId) || staticExtraIdSet.has(productId)) return;
     const idToken = await user.getIdToken();
-    const res = await fetch(`/api/admin/catalog/item/${encodeURIComponent(productId)}`, {
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${idToken}` },
-    });
-    if (!res.ok) {
-      const body = (await res.json().catch(() => ({}))) as { error?: string };
-      showToast(body.error || 'Не удалось удалить товар');
+
+    let deletedInFirestore = false;
+    if (!firestoreQuotaExceeded) {
+      try {
+        await withTimeout(deleteDoc(doc(db, 'products', productId)), 10000);
+        deletedInFirestore = true;
+      } catch (err) {
+        if (isQuotaExceededError(err)) {
+          setFirestoreQuotaExceeded(true);
+        } else {
+          handleFirestoreError(err, OperationType.DELETE, `products/${productId}`);
+        }
+      }
+    }
+
+    const serverRes = await fetchOptionalJsonApi<{ ok?: boolean }>(
+      `/api/admin/catalog/item/${encodeURIComponent(productId)}`,
+      {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${idToken}` },
+      }
+    );
+    if (serverRes.ok) {
+      await onRefreshServerProducts();
+    }
+
+    if (!deletedInFirestore && !serverRes.ok) {
+      showToast('Не удалось удалить товар: превышена дневная квота Firestore');
       return;
     }
 
-    // Best-effort cleanup if the custom item had been saved earlier in Firestore
-    if (!firestoreQuotaExceeded && firestoreProducts.some((p) => p.id === productId)) {
-      void withTimeout(deleteDoc(doc(db, 'products', productId)), 4000).catch((err) => {
-        if (isQuotaExceededError(err)) setFirestoreQuotaExceeded(true);
-      });
-    }
-
-    await onRefreshServerProducts();
     showToast('Товар удалён из каталога');
   };
 
-  const persistSaleToServer = async (salePayload: Omit<SaleRecord, 'createdAt' | 'updatedAt'>) => {
-    if (!user) return;
+  const persistSaleToServer = async (
+    salePayload: Omit<SaleRecord, 'createdAt' | 'updatedAt'>
+  ): Promise<boolean> => {
+    if (!user) return false;
     const idToken = await user.getIdToken();
-    const res = await fetch('/api/admin/sales/item', {
+    const res = await fetchOptionalJsonApi<{ sale?: SaleRecord }>('/api/admin/sales/item', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -422,28 +720,26 @@ export function AdminPanel({
       },
       body: JSON.stringify(salePayload),
     });
+
+    if (!res.available) return false;
     if (!res.ok) {
-      const body = (await res.json().catch(() => ({}))) as { error?: string };
-      throw new Error(body.error || 'Не удалось сохранить продажу на сервере.');
+      throw new Error(res.error || 'Не удалось сохранить продажу на сервере.');
     }
-    const data = (await res.json()) as { sale?: SaleRecord };
-    if (data.sale) {
+    if (res.data?.sale) {
       setServerSales((prev) => {
-        const next = prev.filter((item) => item.id !== data.sale!.id);
-        return [...next, data.sale!];
+        const next = prev.filter((item) => item.id !== res.data!.sale!.id);
+        return [...next, res.data!.sale!];
       });
     }
+    return true;
   };
 
   const handleSaveSale = async (draft: SaleDraft, isEdit: boolean) => {
     if (!user) return;
     const existing = sales.find((s) => s.id === draft.id);
     const createdBy = existing?.createdBy || user.uid;
+    let savedInFirestore = false;
 
-    // 1. Always save to server store immediately (works even when Firestore daily quota is exhausted)
-    await persistSaleToServer({ ...draft, createdBy });
-
-    // 2. Mirror to Firestore when daily quota is available
     if (!firestoreQuotaExceeded) {
       try {
         await withTimeout(
@@ -453,13 +749,25 @@ export function AdminPanel({
             createdAt: existing?.createdAt || serverTimestamp(),
             updatedAt: serverTimestamp(),
           }),
-          5000
+          10000
         );
+        savedInFirestore = true;
       } catch (error) {
         if (isQuotaExceededError(error)) {
           setFirestoreQuotaExceeded(true);
+        } else {
+          handleFirestoreError(
+            error,
+            isEdit ? OperationType.UPDATE : OperationType.CREATE,
+            `sales/${draft.id}`
+          );
         }
       }
+    }
+
+    const savedOnServer = await persistSaleToServer({ ...draft, createdBy });
+    if (!savedInFirestore && !savedOnServer) {
+      throw new Error('Исчерпана дневная квота Firebase Firestore. Попробуйте завтра.');
     }
 
     showToast(isEdit ? `Заказ ${draft.id} обновлён` : `Продажа ${draft.id} добавлена`);
@@ -486,8 +794,7 @@ export function AdminPanel({
       createdBy: sale.createdBy,
     };
 
-    await persistSaleToServer(updatedPayload);
-
+    let savedInFirestore = false;
     if (!firestoreQuotaExceeded) {
       try {
         await withTimeout(
@@ -496,13 +803,22 @@ export function AdminPanel({
             createdAt: sale.createdAt || serverTimestamp(),
             updatedAt: serverTimestamp(),
           }),
-          5000
+          10000
         );
+        savedInFirestore = true;
       } catch (error) {
         if (isQuotaExceededError(error)) {
           setFirestoreQuotaExceeded(true);
+        } else {
+          handleFirestoreError(error, OperationType.UPDATE, `sales/${sale.id}`);
         }
       }
+    }
+
+    const savedOnServer = await persistSaleToServer(updatedPayload);
+    if (!savedInFirestore && !savedOnServer) {
+      showToast('Не удалось обновить статус: превышена дневная квота Firestore');
+      return;
     }
 
     showToast(`Статус заказа ${sale.id} обновлён`);
@@ -511,20 +827,35 @@ export function AdminPanel({
   const handleDeleteSale = async (saleId: string) => {
     if (!user) return;
     const idToken = await user.getIdToken();
-    await fetch(`/api/admin/sales/item/${encodeURIComponent(saleId)}`, {
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${idToken}` },
-    });
-    setServerSales((prev) => prev.filter((item) => item.id !== saleId));
 
+    let deletedInFirestore = false;
     if (!firestoreQuotaExceeded && firestoreSales.some((s) => s.id === saleId)) {
       try {
-        await withTimeout(deleteDoc(doc(db, 'sales', saleId)), 5000);
+        await withTimeout(deleteDoc(doc(db, 'sales', saleId)), 10000);
+        deletedInFirestore = true;
       } catch (error) {
         if (isQuotaExceededError(error)) {
           setFirestoreQuotaExceeded(true);
+        } else {
+          handleFirestoreError(error, OperationType.DELETE, `sales/${saleId}`);
         }
       }
+    }
+
+    const serverRes = await fetchOptionalJsonApi<{ ok?: boolean }>(
+      `/api/admin/sales/item/${encodeURIComponent(saleId)}`,
+      {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${idToken}` },
+      }
+    );
+    if (serverRes.ok) {
+      setServerSales((prev) => prev.filter((item) => item.id !== saleId));
+    }
+
+    if (!deletedInFirestore && !serverRes.ok) {
+      showToast('Не удалось удалить запись: превышена дневная квота Firestore');
+      return;
     }
 
     showToast(`Запись ${saleId} удалена`);
@@ -536,15 +867,21 @@ export function AdminPanel({
     setSyncNotice(null);
     try {
       const idToken = await user.getIdToken();
-      const res = await fetch('/api/admin/checkout-orders', {
-        headers: { Authorization: `Bearer ${idToken}` },
-      });
-      if (!res.ok) {
+      const serverRes = await fetchOptionalJsonApi<{ orders?: ServerCheckoutOrder[] }>(
+        '/api/admin/checkout-orders',
+        { headers: { Authorization: `Bearer ${idToken}` } }
+      );
+      if (!serverRes.available) {
+        setSyncNotice(
+          'Сайт размещён на статическом хостинге без Node-сервера (/api). Заказы можно добавлять вручную.'
+        );
+        return;
+      }
+      if (!serverRes.ok) {
         setSyncNotice('Не удалось получить заказы с кассы сервера.');
         return;
       }
-      const data = (await res.json()) as { orders?: ServerCheckoutOrder[] };
-      const serverOrders = data.orders || [];
+      const serverOrders = serverRes.data?.orders || [];
       const existingIds = new Set(sales.map((s) => s.id));
       const freshOrders = serverOrders.filter((o) => !existingIds.has(o.id));
 
@@ -585,19 +922,19 @@ export function AdminPanel({
         }
       );
 
-      const batchRes = await fetch('/api/admin/sales/batch', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${idToken}`,
-        },
-        body: JSON.stringify({ items: freshSalePayloads }),
-      });
-      if (batchRes.ok) {
-        const saved = (await batchRes.json()) as { sales?: SaleRecord[] };
-        if (Array.isArray(saved.sales)) {
-          setServerSales(saved.sales);
+      const batchRes = await fetchOptionalJsonApi<{ sales?: SaleRecord[] }>(
+        '/api/admin/sales/batch',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${idToken}`,
+          },
+          body: JSON.stringify({ items: freshSalePayloads }),
         }
+      );
+      if (batchRes.ok && Array.isArray(batchRes.data?.sales)) {
+        setServerSales(batchRes.data.sales);
       }
 
       if (!firestoreQuotaExceeded) {
@@ -610,7 +947,7 @@ export function AdminPanel({
               updatedAt: serverTimestamp(),
             });
           }
-          await withTimeout(batch.commit(), 5000);
+          await withTimeout(batch.commit(), 8000);
         } catch (err) {
           if (isQuotaExceededError(err)) {
             setFirestoreQuotaExceeded(true);
@@ -623,6 +960,87 @@ export function AdminPanel({
       setSyncNotice('Не удалось синхронизировать заказы с сервером.');
     } finally {
       setSyncingCheckout(false);
+    }
+  };
+
+  const handleTestTelegram = async () => {
+    if (!user || testingTelegram) return;
+    setTestingTelegram(true);
+    setTelegramNotice(null);
+    try {
+      const idToken = await user.getIdToken();
+      const res = await fetchOptionalJsonApi<{ ok?: boolean; sentCount?: number; totalChats?: number }>(
+        '/api/admin/telegram/test',
+        {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${idToken}` },
+        }
+      );
+      if (!res.available) {
+        setTelegramNotice({
+          ok: false,
+          text: 'Сервер оплаты (/api) не подключён на этом хостинге.',
+        });
+        return;
+      }
+      if (!res.ok) {
+        setTelegramNotice({
+          ok: false,
+          text: res.error || 'Не удалось отправить тестовое сообщение в Telegram.',
+        });
+        return;
+      }
+      setTelegramNotice({
+        ok: true,
+        text: `Тестовое уведомление доставлено в Telegram (чатов: ${res.data?.sentCount ?? 1}).`,
+      });
+    } catch {
+      setTelegramNotice({
+        ok: false,
+        text: 'Ошибка соединения при отправке теста в Telegram.',
+      });
+    } finally {
+      setTestingTelegram(false);
+    }
+  };
+
+  const handleDetectTelegramChats = async () => {
+    if (!user || detectingTelegram) return;
+    setDetectingTelegram(true);
+    setTelegramNotice(null);
+    try {
+      const idToken = await user.getIdToken();
+      const res = await fetchOptionalJsonApi<{
+        chats?: Array<{ id: string; label: string; type: string }>;
+      }>('/api/admin/telegram/detect-chat', {
+        headers: { Authorization: `Bearer ${idToken}` },
+      });
+      if (!res.available) {
+        setTelegramNotice({ ok: false, text: 'Сервер оплаты (/api) не подключён.' });
+        return;
+      }
+      if (!res.ok) {
+        setTelegramNotice({
+          ok: false,
+          text: res.error || 'Не удалось опросить Telegram API.',
+        });
+        return;
+      }
+      const chats = Array.isArray(res.data?.chats) ? res.data.chats : [];
+      setDetectedTelegramChats(chats);
+      if (chats.length === 0) {
+        setTelegramNotice({
+          ok: false,
+          text: 'Пока никто не писал боту. Откройте своего бота в Telegram, нажмите Start (/start) и повторите поиск.',
+        });
+      }
+    } catch {
+      setTelegramNotice({
+        ok: false,
+        text: 'Ошибка соединения при поиске Chat ID.',
+      });
+    } finally {
+      setDetectingTelegram(false);
     }
   };
 
@@ -643,10 +1061,19 @@ export function AdminPanel({
     return (
       <div className="min-h-screen bg-[#F5F6F8] flex flex-col items-center justify-center p-6">
         <div className="w-full max-w-md bg-white border border-neutral-200 rounded-xl overflow-hidden shadow-xs">
-          <div className="bg-[#111111] text-white px-6 py-5 border-b border-neutral-800">
-            <div className="text-lg font-bold tracking-tight">CyberGameStore</div>
-            <div className="text-xs text-neutral-400 mt-0.5">
-              Панель управления магазином
+          <div className="bg-[#111111] text-white px-6 py-5 border-b border-neutral-800 flex items-center gap-3">
+            <img
+              src="/assets/aistudio/image_7c19fec9.png"
+              alt="CyberGameStore"
+              width={36}
+              height={36}
+              className="w-9 h-9 rounded-lg object-contain shrink-0"
+            />
+            <div>
+              <div className="text-lg font-bold tracking-tight">CyberGameStore</div>
+              <div className="text-xs text-neutral-400 mt-0.5">
+                Панель управления магазином
+              </div>
             </div>
           </div>
           <div className="p-6 space-y-5">
@@ -661,8 +1088,58 @@ export function AdminPanel({
             </div>
 
             {authError && (
-              <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700">
-                {authError}
+              <div className="p-3.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-800 space-y-2.5">
+                <p className="font-medium leading-relaxed">{authError}</p>
+
+                {authErrorKind === 'unauthorized-domain' && (
+                  <div className="space-y-2 pt-1 border-t border-red-200/80 text-neutral-800">
+                    <p className="text-[11px] leading-relaxed">
+                      Добавьте этот домен в Firebase Console (Authentication → Settings → Authorized domains):
+                    </p>
+                    <div className="flex items-center justify-between gap-2 bg-white border border-red-200 rounded px-2.5 py-1.5">
+                      <code className="font-mono text-[11px] text-neutral-900 truncate">
+                        {window.location.hostname}
+                      </code>
+                      <button
+                        type="button"
+                        onClick={() => void handleCopyHostname()}
+                        className="inline-flex items-center gap-1 text-[11px] font-semibold text-neutral-700 hover:text-black shrink-0 cursor-pointer"
+                      >
+                        {copiedDomain ? (
+                          <>
+                            <Check className="w-3.5 h-3.5 text-[#52c44c]" />
+                            <span>Скопировано</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3.5 h-3.5" />
+                            <span>Копировать</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                    <a
+                      href={FIREBASE_AUTH_SETTINGS_URL}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 text-[11px] font-semibold text-red-900 underline hover:text-black"
+                    >
+                      <span>Открыть настройки доменов Firebase Auth</span>
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </div>
+                )}
+
+                {authErrorKind === 'popup-blocked' && (
+                  <button
+                    type="button"
+                    disabled={signingIn}
+                    onClick={() => void handleGoogleRedirectSignIn()}
+                    className="w-full py-2 px-3 text-xs font-semibold text-white bg-[#111111] hover:bg-neutral-800 rounded-md cursor-pointer"
+                  >
+                    Войти через перенаправление Google
+                  </button>
+                )}
               </div>
             )}
 
@@ -756,7 +1233,7 @@ export function AdminPanel({
 
   const openEditProduct = (product: StoreProduct) => {
     setEditingProductDraft(storeProductToEditorDraft(product, overrideMap.get(product.id)));
-    setEditingIsBuiltin(BUILTIN_PRODUCT_IDS.has(product.id));
+    setEditingIsBuiltin(BUILTIN_PRODUCT_IDS.has(product.id) || staticExtraIdSet.has(product.id));
     setProductModalOpen(true);
   };
 
@@ -789,9 +1266,18 @@ export function AdminPanel({
   const renderSidebarContent = () => (
     <div className="flex flex-col h-full bg-[#111111] text-white">
       <div className="px-5 h-16 flex items-center justify-between border-b border-neutral-800 shrink-0">
-        <div>
-          <div className="text-base font-bold tracking-tight text-white">CyberGameStore</div>
-          <div className="text-[11px] text-neutral-400">Панель управления</div>
+        <div className="flex items-center gap-2.5 min-w-0">
+          <img
+            src="/assets/aistudio/image_7c19fec9.png"
+            alt="CyberGameStore"
+            width={28}
+            height={28}
+            className="w-7 h-7 rounded-md object-contain shrink-0"
+          />
+          <div className="min-w-0">
+            <div className="text-base font-bold tracking-tight text-white truncate">CyberGameStore</div>
+            <div className="text-[11px] text-neutral-400">Панель управления</div>
+          </div>
         </div>
         <button
           type="button"
@@ -1006,6 +1492,7 @@ export function AdminPanel({
                 <AdminProductsTab
                   allProducts={allAdminProducts}
                   overrideMap={overrideMap}
+                  staticExtraIdSet={staticExtraIdSet}
                   onAddProduct={openCreateProduct}
                   onImportJson={() => setImportModalOpen(true)}
                   onEditProduct={openEditProduct}
@@ -1020,11 +1507,18 @@ export function AdminPanel({
                   sales={sales}
                   syncingCheckout={syncingCheckout}
                   syncNotice={syncNotice}
+                  telegramStatus={telegramStatus}
+                  testingTelegram={testingTelegram}
+                  detectingTelegram={detectingTelegram}
+                  detectedTelegramChats={detectedTelegramChats}
+                  telegramNotice={telegramNotice}
                   onAddSale={openCreateSale}
                   onEditSale={openEditSale}
                   onUpdateStatus={handleUpdateSaleStatus}
                   onDeleteSale={handleDeleteSale}
                   onSyncServerOrders={handleSyncServerOrders}
+                  onTestTelegram={handleTestTelegram}
+                  onDetectTelegramChats={handleDetectTelegramChats}
                 />
               )}
             </>

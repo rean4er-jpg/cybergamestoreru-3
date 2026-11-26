@@ -52,8 +52,8 @@ export function LegalViews({ route, onNavigate }: LegalViewsProps) {
               <div className="font-mono text-xs font-semibold text-[#52c44c]">01. Оформление</div>
               <h2 className="text-lg font-bold italic text-neutral-900">Выбор игры</h2>
               <p className="text-sm text-neutral-600 leading-relaxed">
-                Добавьте нужную игру и издание в корзину, укажите Telegram или Email. Если турецкого
-                аккаунта ещё нет, мы бесплатно создадим его на вашу почту.
+                Добавьте нужную игру, подписку или ключ в корзину и укажите ваш Telegram (@username).
+                Если турецкого аккаунта ещё нет — бесплатно создадим его и передадим данные в Telegram.
               </p>
             </div>
             <div className="space-y-2">

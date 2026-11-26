@@ -25,6 +25,7 @@ type ProductFilterTab = 'all' | 'custom' | 'xbox' | 'ps' | 'subscriptions' | 'hi
 interface AdminProductsTabProps {
   allProducts: StoreProduct[];
   overrideMap: Map<string, FirestoreProductDoc>;
+  staticExtraIdSet: Set<string>;
   onAddProduct: () => void;
   onImportJson: () => void;
   onEditProduct: (product: StoreProduct) => void;
@@ -38,6 +39,7 @@ const PAGE_SIZE = 20;
 export function AdminProductsTab({
   allProducts,
   overrideMap,
+  staticExtraIdSet,
   onAddProduct,
   onImportJson,
   onEditProduct,
@@ -64,21 +66,23 @@ export function AdminProductsTab({
     for (const p of allProducts) {
       const ov = overrideMap.get(p.id);
       const isHidden = ov?.isHidden ?? false;
+      const isBaseItem = BUILTIN_PRODUCT_IDS.has(p.id) || staticExtraIdSet.has(p.id);
       if (isHidden) hidden++;
-      if (!BUILTIN_PRODUCT_IDS.has(p.id) || ov) custom++;
+      if (!isBaseItem || ov) custom++;
       if (p.categoryType === 'subscriptions') subs++;
       else if (p.platformGroup === 'ps') ps++;
       else xbox++;
     }
     return { all: allProducts.length, custom, xbox, ps, subs, hidden };
-  }, [allProducts, overrideMap]);
+  }, [allProducts, overrideMap, staticExtraIdSet]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     return allProducts.filter((p) => {
       const ov = overrideMap.get(p.id);
       const isHidden = ov?.isHidden ?? false;
-      const isCustomOrEdited = !BUILTIN_PRODUCT_IDS.has(p.id) || Boolean(ov);
+      const isBaseItem = BUILTIN_PRODUCT_IDS.has(p.id) || staticExtraIdSet.has(p.id);
+      const isCustomOrEdited = !isBaseItem || Boolean(ov);
 
       if (filterTab === 'custom' && !isCustomOrEdited) return false;
       if (filterTab === 'hidden' && !isHidden) return false;
@@ -96,7 +100,7 @@ export function AdminProductsTab({
         p.platformLabel.toLowerCase().includes(q)
       );
     });
-  }, [allProducts, overrideMap, filterTab, search]);
+  }, [allProducts, overrideMap, staticExtraIdSet, filterTab, search]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
@@ -231,8 +235,9 @@ export function AdminProductsTab({
                 <tbody className="divide-y divide-neutral-100 text-xs">
                   {paginated.map((product) => {
                     const ov = overrideMap.get(product.id);
-                    const isCustom = !BUILTIN_PRODUCT_IDS.has(product.id);
-                    const isEditedBuiltin = BUILTIN_PRODUCT_IDS.has(product.id) && Boolean(ov);
+                    const isBaseItem = BUILTIN_PRODUCT_IDS.has(product.id) || staticExtraIdSet.has(product.id);
+                    const isCustom = !isBaseItem;
+                    const isEditedBuiltin = isBaseItem && Boolean(ov);
                     const isHidden = ov?.isHidden ?? false;
                     const variant = product.variants[0];
                     const isEditingPrice = editingPriceId === product.id;
@@ -251,7 +256,7 @@ export function AdminProductsTab({
                                 src={product.image}
                                 alt={product.title}
                                 fallbackTone={product.fallbackTone}
-                                className="w-full h-full object-cover"
+                                className="w-full h-full"
                               />
                             </div>
                             <div className="min-w-0">

@@ -8,7 +8,14 @@ import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import express, { type Request, type Response } from 'express';
 import { createServer as createViteServer } from 'vite';
-import { STORE_PRODUCTS, type ProductVariant } from './src/data/storeData.ts';
+import { mapRawToProduct, STORE_PRODUCTS, type ProductVariant } from './src/data/storeData.ts';
+import type { RawCatalogItem } from './src/data/catalogRaw.ts';
+import {
+  buildRoutePath,
+  getRouteSeoMetadata,
+  parsePathname,
+  SITE_LOGO_PATH,
+} from './src/data/seoRoutes.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -44,6 +51,8 @@ interface OrderRecord {
   sbpQrPayload?: string;
   createdAt: string;
   paidAt?: string;
+  telegramPaidNotified?: boolean;
+  telegramCreatedNotified?: boolean;
 }
 
 const PORT = Number(process.env.PORT || 3000);
@@ -52,13 +61,41 @@ const TBANK_API_BASE = 'https://securepay.tinkoff.ru/v2';
 
 const orders = new Map<string, OrderRecord>();
 
+interface SeoProductRecord {
+  id: string;
+  title: string;
+  platformLabel: string;
+  platformGroup: 'ps' | 'xbox';
+  categoryType: 'games' | 'subscriptions';
+  brand: string;
+  image: string;
+  shortDescription: string;
+  featuredScore: number;
+  priceRub: number;
+  inStock: boolean;
+}
+
 // Authoritative catalog lookup built exclusively on the server
 const catalogLookup = new Map<
   string,
   { productTitle: string; platformLabel: string; variant: ProductVariant }
 >();
+const seoProductLookup = new Map<string, SeoProductRecord>();
 
 for (const product of STORE_PRODUCTS) {
+  seoProductLookup.set(product.id, {
+    id: product.id,
+    title: product.title,
+    platformLabel: product.platformLabel,
+    platformGroup: product.platformGroup,
+    categoryType: product.categoryType,
+    brand: product.brand || (product.platformGroup === 'ps' ? 'Sony PlayStation' : 'Xbox / Microsoft'),
+    image: product.image,
+    shortDescription: product.shortDescription,
+    featuredScore: product.featuredScore || 0,
+    priceRub: product.variants[0]?.priceRub || 0,
+    inStock: product.variants.some((v) => v.inStock),
+  });
   for (const variant of product.variants) {
     catalogLookup.set(`${product.id}::${variant.id}`, {
       productTitle: product.title,
@@ -68,13 +105,78 @@ for (const product of STORE_PRODUCTS) {
   }
 }
 
+function loadStaticChunksIntoLookup() {
+  try {
+    const publicDir = path.resolve(__dirname, 'public');
+    const manifestPath = path.join(publicDir, 'catalog-data', 'manifest.json');
+    if (!fs.existsSync(manifestPath)) return;
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as {
+      descriptions?: string[];
+      parts?: string[];
+    };
+    const descriptions = Array.isArray(manifest.descriptions) ? manifest.descriptions : [];
+    const parts = Array.isArray(manifest.parts) ? manifest.parts : [];
+    for (const partRelUrl of parts) {
+      const partPath = path.join(publicDir, partRelUrl.replace(/^\/+/, ''));
+      if (!fs.existsSync(partPath)) continue;
+      const items = JSON.parse(fs.readFileSync(partPath, 'utf8')) as Array<
+        Omit<RawCatalogItem, 'description'> & { description?: string; dIdx?: number }
+      >;
+      if (!Array.isArray(items)) continue;
+      for (const compact of items) {
+        if (!compact || !compact.id) continue;
+        const description =
+          typeof compact.description === 'string'
+            ? compact.description
+            : typeof compact.dIdx === 'number'
+              ? descriptions[compact.dIdx] || ''
+              : '';
+        const product = mapRawToProduct({ ...compact, description });
+        if (!seoProductLookup.has(product.id)) {
+          seoProductLookup.set(product.id, {
+            id: product.id,
+            title: product.title,
+            platformLabel: product.platformLabel,
+            platformGroup: product.platformGroup,
+            categoryType: product.categoryType,
+            brand:
+              product.brand || (product.platformGroup === 'ps' ? 'Sony PlayStation' : 'Xbox / Microsoft'),
+            image: product.image,
+            shortDescription: product.shortDescription,
+            featuredScore: product.featuredScore || 0,
+            priceRub: product.variants[0]?.priceRub || 0,
+            inStock: product.variants.some((v) => v.inStock),
+          });
+        }
+        for (const variant of product.variants) {
+          const key = `${product.id}::${variant.id}`;
+          if (!catalogLookup.has(key)) {
+            catalogLookup.set(key, {
+              productTitle: product.title,
+              platformLabel: product.platformLabel,
+              variant,
+            });
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Failed to preload static catalog-data chunks:', err);
+  }
+}
+
+loadStaticChunksIntoLookup();
+
 interface FirebaseAppletConfig {
   projectId: string;
   apiKey: string;
   firestoreDatabaseId: string;
 }
 
-const BOOTSTRAP_ADMIN_EMAIL = 'rean4er@gmail.com';
+const BOOTSTRAP_ADMIN_EMAILS = new Set([
+  'rean4er@gmail.com',
+  'cybergamestoreru@gmail.com',
+]);
 
 function loadFirebaseAppletConfig(): FirebaseAppletConfig | null {
   try {
@@ -157,6 +259,7 @@ interface ServerSaleRecord {
 const DATA_DIR = path.resolve(__dirname, 'data');
 const CUSTOM_CATALOG_FILE = path.join(DATA_DIR, 'custom-catalog.json');
 const ADMIN_SALES_FILE = path.join(DATA_DIR, 'admin-sales.json');
+const CHECKOUT_ORDERS_FILE = path.join(DATA_DIR, 'checkout-orders.json');
 
 const customCatalogMap = new Map<string, ServerCatalogItem>();
 const serverSalesMap = new Map<string, ServerSaleRecord>();
@@ -221,6 +324,21 @@ function loadPersistentStores() {
   } catch (err) {
     console.error('Failed to load admin-sales.json:', err);
   }
+
+  try {
+    if (fs.existsSync(CHECKOUT_ORDERS_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(CHECKOUT_ORDERS_FILE, 'utf8'));
+      if (Array.isArray(parsed)) {
+        for (const row of parsed) {
+          if (row && typeof row === 'object' && typeof row.id === 'string' && typeof row.accessToken === 'string') {
+            orders.set(row.id, row as OrderRecord);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Failed to load checkout-orders.json:', err);
+  }
 }
 
 loadPersistentStores();
@@ -232,6 +350,59 @@ function persistCustomCatalog() {
 
 function persistServerSales() {
   atomicWriteJson(ADMIN_SALES_FILE, Array.from(serverSalesMap.values()));
+}
+
+function persistCheckoutOrders() {
+  atomicWriteJson(CHECKOUT_ORDERS_FILE, Array.from(orders.values()));
+}
+
+function upsertCheckoutOrderIntoSales(order: OrderRecord) {
+  const existing = serverSalesMap.get(order.id);
+  const firstItem = order.items[0];
+  const totalQty = Math.max(
+    1,
+    Math.min(
+      100,
+      order.items.reduce((sum, item) => sum + item.quantity, 0)
+    )
+  );
+  const baseTitle =
+    order.items.length > 1
+      ? `${firstItem?.title || 'Заказ'} (+ ещё ${order.items.length - 1})`
+      : firstItem?.title || 'Заказ с сайта';
+  const isPs = /playstation|ps4|ps5/i.test(firstItem?.platformLabel || '');
+  const isSub = /game pass|ps plus|подписк|ea play/i.test(baseTitle);
+  const nowIso = new Date().toISOString();
+  const noteParts = [
+    order.provider === 'sandbox' ? '[Тест Sandbox]' : '',
+    order.accountStatus,
+    order.turkAccountEmail ? `Логин: ${order.turkAccountEmail}` : '',
+  ].filter(Boolean);
+
+  const saleRecord: ServerSaleRecord = {
+    id: order.id,
+    orderDate: (order.paidAt || order.createdAt || nowIso).slice(0, 10),
+    productId: (firstItem?.productId || 'site-order').slice(0, 80),
+    productTitle: baseTitle.slice(0, 160),
+    platformGroup: isPs ? 'ps' : 'xbox',
+    categoryType: isSub ? 'subscriptions' : 'games',
+    quantity: totalQty,
+    unitPriceRub: Math.max(1, Math.round(order.amountRub / totalQty)),
+    totalRub: Math.max(1, Math.round(order.amountRub)),
+    status: order.status,
+    channel: 'site',
+    paymentMethod: order.paymentMethod,
+    customerName: (order.customerName || 'Покупатель').slice(0, 120),
+    customerContact: (order.contact || '').slice(0, 160),
+    note: noteParts.join(' · ').slice(0, 400),
+    createdBy: existing?.createdBy || 'checkout-system',
+    createdAt: existing?.createdAt || order.createdAt || nowIso,
+    updatedAt: nowIso,
+  };
+
+  serverSalesMap.set(order.id, saleRecord);
+  persistServerSales();
+  persistCheckoutOrders();
 }
 
 function sanitizeServerCatalogItem(
@@ -487,7 +658,8 @@ async function verifyAdminBearerToken(
       user &&
       user.localId &&
       user.emailVerified === true &&
-      user.email?.toLowerCase() === BOOTSTRAP_ADMIN_EMAIL
+      typeof user.email === 'string' &&
+      BOOTSTRAP_ADMIN_EMAILS.has(user.email.toLowerCase())
     ) {
       return { uid: user.localId, email: user.email };
     }
@@ -551,6 +723,213 @@ function safeCompareStrings(a: string, b: string): boolean {
   const bufB = Buffer.from(b, 'utf8');
   if (bufA.length !== bufB.length) return false;
   return crypto.timingSafeEqual(bufA, bufB);
+}
+
+function getTelegramBotToken(): string {
+  return process.env.TELEGRAM_BOT_TOKEN?.trim() || '';
+}
+
+function getTelegramBotId(botToken: string): string {
+  const idx = botToken.indexOf(':');
+  if (idx <= 0) return '';
+  const prefix = botToken.slice(0, idx).trim();
+  return /^\d+$/.test(prefix) ? prefix : '';
+}
+
+function getTelegramNotificationConfig(): {
+  botToken: string;
+  botId: string;
+  chatIds: string[];
+  hasOnlyBotSelfId: boolean;
+  notifyOnCreate: boolean;
+} | null {
+  const botToken = getTelegramBotToken();
+  const rawChatIds = process.env.TELEGRAM_CHAT_ID?.trim() || '';
+  if (!botToken || !rawChatIds) return null;
+
+  const botId = getTelegramBotId(botToken);
+  const parsedIds = Array.from(
+    new Set(
+      rawChatIds
+        .split(/[,\s]+/)
+        .map((id) => id.trim())
+        .filter((id) => /^-?\d{3,20}$/.test(id) || /^@[a-zA-Z0-9_]{5,32}$/.test(id))
+    )
+  );
+  if (parsedIds.length === 0) return null;
+
+  const chatIds = parsedIds.filter((id) => !botId || id !== botId);
+  const hasOnlyBotSelfId = chatIds.length === 0 && parsedIds.some((id) => Boolean(botId && id === botId));
+
+  const notifyOnCreate = process.env.TELEGRAM_NOTIFY_ON_CREATE?.trim().toLowerCase() === 'true';
+  return { botToken, botId, chatIds, hasOnlyBotSelfId, notifyOnCreate };
+}
+
+function escapeTelegramHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function formatTelegramContactHtml(contact: string): string {
+  const trimmed = contact.trim();
+  const match = trimmed.match(/^@?([a-zA-Z0-9_]{5,32})$/);
+  if (match) {
+    const username = match[1];
+    return `<a href="https://t.me/${username}">@${username}</a>`;
+  }
+  return escapeTelegramHtml(trimmed);
+}
+
+function formatOrderTelegramMessage(order: OrderRecord, event: 'paid' | 'created'): string {
+  const header =
+    event === 'paid'
+      ? order.provider === 'sandbox'
+        ? '🧪 <b>Тестовая оплата (Sandbox) — CyberGameStore</b>'
+        : '✅ <b>Новый оплаченный заказ — CyberGameStore!</b>'
+      : '🛒 <b>Новый заказ ожидает оплаты — CyberGameStore</b>';
+
+  const methodLabel = order.paymentMethod === 'sbp' ? 'СБП' : 'Карта РФ';
+  const amountFormatted = order.amountRub.toLocaleString('ru-RU');
+  const timestampStr = new Intl.DateTimeFormat('ru-RU', {
+    dateStyle: 'short',
+    timeStyle: 'short',
+    timeZone: 'Europe/Moscow',
+  }).format(new Date(order.paidAt || order.createdAt));
+
+  const itemsLines = order.items.map((item) => {
+    const lineSum = (item.unitPriceRub * item.quantity).toLocaleString('ru-RU');
+    return `• ${escapeTelegramHtml(item.title)} (${escapeTelegramHtml(item.platformLabel)} · ${escapeTelegramHtml(item.variantLabel)}) × ${item.quantity} — ${lineSum} ₽`;
+  });
+
+  const lines = [
+    header,
+    '',
+    `🧾 <b>Заказ:</b> <code>${escapeTelegramHtml(order.id)}</code>`,
+    `💰 <b>Сумма:</b> <b>${amountFormatted} ₽</b> (${methodLabel})`,
+    '',
+    '🎮 <b>Состав заказа:</b>',
+    ...itemsLines,
+    '',
+    `👤 <b>Покупатель:</b> ${escapeTelegramHtml(order.customerName)}`,
+    `💬 <b>Telegram:</b> ${formatTelegramContactHtml(order.contact)}`,
+    `🌍 <b>Аккаунт:</b> ${escapeTelegramHtml(order.accountStatus)}`,
+  ];
+
+  if (order.turkAccountEmail) {
+    lines.push(`🔑 <b>Логин аккаунта:</b> <code>${escapeTelegramHtml(order.turkAccountEmail)}</code>`);
+  }
+
+  lines.push(`🕒 <b>Время (МСК):</b> ${escapeTelegramHtml(timestampStr)}`);
+
+  const fullText = lines.join('\n');
+  return fullText.length > 3950 ? `${fullText.slice(0, 3940)}\n…` : fullText;
+}
+
+async function sendTelegramMessage(
+  text: string
+): Promise<{ ok: boolean; sentCount: number; totalChats: number; error?: string }> {
+  const cfg = getTelegramNotificationConfig();
+  if (!cfg) {
+    return {
+      ok: false,
+      sentCount: 0,
+      totalChats: 0,
+      error: 'TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не настроены.',
+    };
+  }
+
+  if (cfg.hasOnlyBotSelfId || cfg.chatIds.length === 0) {
+    return {
+      ok: false,
+      sentCount: 0,
+      totalChats: 0,
+      error:
+        'В TELEGRAM_CHAT_ID указан ID самого бота, а нужен ваш личный Telegram Chat ID (узнайте его через @userinfobot или кнопку «Найти мой Chat ID» в админке).',
+    };
+  }
+
+  const endpoint = `https://api.telegram.org/bot${encodeURIComponent(cfg.botToken)}/sendMessage`;
+  let sentCount = 0;
+  let lastError = '';
+
+  for (const chatId of cfg.chatIds) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8000);
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text,
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+        }),
+        signal: controller.signal,
+      }).finally(() => clearTimeout(timer));
+
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        description?: string;
+      };
+
+      if (res.ok && data.ok) {
+        sentCount++;
+      } else {
+        const desc = data.description || `HTTP ${res.status}`;
+        if (/bot can't send messages to the bot/i.test(desc)) {
+          lastError =
+            'В TELEGRAM_CHAT_ID указан ID самого бота, а нужен ваш личный Telegram Chat ID.';
+        } else if (/chat not found|bot was blocked|user is deactivated/i.test(desc)) {
+          lastError =
+            'Бот не может написать в этот чат. Откройте бота в Telegram и обязательно нажмите /start.';
+        } else {
+          lastError = desc;
+        }
+        console.warn(`Telegram sendMessage skipped/failed for chat ${chatId}: ${desc}`);
+      }
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : 'Network error';
+      console.warn(`Telegram sendMessage network error for chat ${chatId}: ${lastError}`);
+    }
+  }
+
+  return {
+    ok: sentCount > 0,
+    sentCount,
+    totalChats: cfg.chatIds.length,
+    error: sentCount > 0 ? undefined : lastError || 'Не удалось отправить сообщение в Telegram.',
+  };
+}
+
+async function triggerOrderTelegramNotification(
+  order: OrderRecord,
+  event: 'paid' | 'created'
+): Promise<void> {
+  const cfg = getTelegramNotificationConfig();
+  if (!cfg || cfg.chatIds.length === 0) return;
+
+  if (event === 'created') {
+    if (!cfg.notifyOnCreate || order.telegramCreatedNotified) return;
+    order.telegramCreatedNotified = true;
+  } else {
+    if (order.telegramPaidNotified) return;
+    order.telegramPaidNotified = true;
+  }
+
+  const message = formatOrderTelegramMessage(order, event);
+  const result = await sendTelegramMessage(message);
+  if (!result.ok) {
+    // Allow retry on subsequent webhook/status sync if all chats failed
+    if (event === 'created') {
+      order.telegramCreatedNotified = false;
+    } else {
+      order.telegramPaidNotified = false;
+    }
+  }
 }
 
 /**
@@ -798,12 +1177,15 @@ async function syncTbankOrderStatus(order: OrderRecord): Promise<void> {
   if (state.Status === 'CONFIRMED' && Number(state.Amount) === order.amountRub * 100) {
     order.status = 'paid';
     order.paidAt = new Date().toISOString();
+    upsertCheckoutOrderIntoSales(order);
+    void triggerOrderTelegramNotification(order, 'paid');
   } else if (
     state.Status === 'CANCELED' ||
     state.Status === 'REJECTED' ||
     state.Status === 'DEADLINE_EXPIRED'
   ) {
     order.status = 'cancelled';
+    upsertCheckoutOrderIntoSales(order);
   }
 }
 
@@ -1030,7 +1412,7 @@ async function startServer() {
           : undefined;
 
       if (customerName.length < 2 || contact.length < 3) {
-        res.status(400).json({ error: 'Укажите ваше имя и контакт (Telegram или Email).' });
+        res.status(400).json({ error: 'Укажите ваше имя и Telegram (@username).' });
         return;
       }
 
@@ -1106,6 +1488,8 @@ async function startServer() {
 
       pruneOrdersIfNeeded();
       orders.set(order.id, order);
+      upsertCheckoutOrderIntoSales(order);
+      void triggerOrderTelegramNotification(order, 'created');
 
       res.json({
         mode: config.isSandbox ? 'sandbox' : 'live',
@@ -1161,6 +1545,137 @@ async function startServer() {
     res.json({ orders: list });
   });
 
+  app.get('/api/admin/telegram/status', async (req: Request, res: Response) => {
+    const adminUser = await verifyAdminBearerToken(req);
+    if (!adminUser) {
+      res.status(403).json({ error: 'Доступ разрешён только администратору.' });
+      return;
+    }
+    const botToken = getTelegramBotToken();
+    const cfg = getTelegramNotificationConfig();
+    res.json({
+      hasBotToken: Boolean(botToken),
+      configured: Boolean(cfg && cfg.chatIds.length > 0),
+      chatCount: cfg?.chatIds.length ?? 0,
+      hasOnlyBotSelfId: Boolean(cfg?.hasOnlyBotSelfId),
+      notifyOnCreate: cfg?.notifyOnCreate ?? false,
+    });
+  });
+
+  app.get('/api/admin/telegram/detect-chat', async (req: Request, res: Response) => {
+    const adminUser = await verifyAdminBearerToken(req);
+    if (!adminUser) {
+      res.status(403).json({ error: 'Доступ разрешён только администратору.' });
+      return;
+    }
+    const botToken = getTelegramBotToken();
+    if (!botToken) {
+      res.status(400).json({ error: 'Сначала задайте TELEGRAM_BOT_TOKEN в секретах сервера.' });
+      return;
+    }
+
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8000);
+      const updatesRes = await fetch(
+        `https://api.telegram.org/bot${encodeURIComponent(botToken)}/getUpdates?limit=15`,
+        { signal: controller.signal }
+      ).finally(() => clearTimeout(timer));
+
+      const data = (await updatesRes.json().catch(() => ({}))) as {
+        ok?: boolean;
+        description?: string;
+        result?: Array<{
+          message?: {
+            chat?: {
+              id?: number | string;
+              type?: string;
+              username?: string;
+              first_name?: string;
+              last_name?: string;
+              title?: string;
+            };
+          };
+        }>;
+      };
+
+      if (!updatesRes.ok || !data.ok) {
+        res.status(502).json({
+          error: data.description || 'Не удалось получить обновления от Telegram Bot API.',
+        });
+        return;
+      }
+
+      const botId = getTelegramBotId(botToken);
+      const chatsById = new Map<string, { id: string; label: string; type: string }>();
+
+      for (const update of data.result || []) {
+        const chat = update?.message?.chat;
+        if (!chat || chat.id === undefined || chat.id === null) continue;
+        const idStr = String(chat.id);
+        if (botId && idStr === botId) continue;
+        const fullName = [chat.first_name, chat.last_name].filter(Boolean).join(' ').trim();
+        const label =
+          chat.title ||
+          [fullName, chat.username ? `@${chat.username}` : ''].filter(Boolean).join(' · ') ||
+          idStr;
+        chatsById.set(idStr, {
+          id: idStr,
+          label,
+          type: chat.type || 'private',
+        });
+      }
+
+      res.json({ chats: Array.from(chatsById.values()) });
+    } catch {
+      res.status(502).json({ error: 'Ошибка соединения с Telegram API при поиске Chat ID.' });
+    }
+  });
+
+  app.post('/api/admin/telegram/test', async (req: Request, res: Response) => {
+    const adminUser = await verifyAdminBearerToken(req);
+    if (!adminUser) {
+      res.status(403).json({ error: 'Доступ разрешён только администратору.' });
+      return;
+    }
+    const cfg = getTelegramNotificationConfig();
+    if (!cfg || cfg.hasOnlyBotSelfId || cfg.chatIds.length === 0) {
+      res.status(400).json({
+        error: cfg?.hasOnlyBotSelfId
+          ? 'В TELEGRAM_CHAT_ID указан ID самого бота, а нужен ваш личный Telegram Chat ID (узнайте через @userinfobot или кнопку «Найти мой Chat ID»).'
+          : 'Не заданы TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID в переменных окружения сервера.',
+      });
+      return;
+    }
+
+    const nowMsk = new Intl.DateTimeFormat('ru-RU', {
+      dateStyle: 'short',
+      timeStyle: 'short',
+      timeZone: 'Europe/Moscow',
+    }).format(new Date());
+
+    const testMessage = [
+      '🔔 <b>Тестовое уведомление — CyberGameStore</b>',
+      '',
+      'Оповещения о новых покупках настроены и работают корректно.',
+      `👤 Инициатор теста: <code>${escapeTelegramHtml(adminUser.email)}</code>`,
+      `🕒 Время (МСК): ${escapeTelegramHtml(nowMsk)}`,
+    ].join('\n');
+
+    const result = await sendTelegramMessage(testMessage);
+    if (!result.ok) {
+      res.status(502).json({
+        error: `Telegram API: ${result.error || 'проверьте токен бота и что вы нажали /start в боте'}.`,
+      });
+      return;
+    }
+    res.json({
+      ok: true,
+      sentCount: result.sentCount,
+      totalChats: result.totalChats,
+    });
+  });
+
   app.post('/api/payments/sandbox/confirm', (req: Request, res: Response) => {
     const config = getProviderConfig();
     if (!config.isSandbox) {
@@ -1187,9 +1702,12 @@ async function startServer() {
 
     if (action === 'cancel') {
       order.status = 'cancelled';
+      upsertCheckoutOrderIntoSales(order);
     } else if (order.status === 'pending') {
       order.status = 'paid';
       order.paidAt = new Date().toISOString();
+      upsertCheckoutOrderIntoSales(order);
+      void triggerOrderTelegramNotification(order, 'paid');
     }
 
     res.json(sanitizeOrderForClient(order));
@@ -1230,8 +1748,11 @@ async function startServer() {
       ) {
         order.status = 'paid';
         order.paidAt = new Date().toISOString();
+        upsertCheckoutOrderIntoSales(order);
+        void triggerOrderTelegramNotification(order, 'paid');
       } else if (status === 'CANCELED' || status === 'REJECTED' || status === 'DEADLINE_EXPIRED') {
         order.status = 'cancelled';
+        upsertCheckoutOrderIntoSales(order);
       }
     }
 
@@ -1239,13 +1760,310 @@ async function startServer() {
     res.status(200).send('OK');
   });
 
+  function findSeoProductById(productId: string): SeoProductRecord | null {
+    const customItem = customCatalogMap.get(productId);
+    if (customItem) {
+      if (customItem.isHidden) return null;
+      return {
+        id: customItem.id,
+        title: customItem.title,
+        platformLabel: customItem.platformLabel,
+        platformGroup: customItem.platformGroup,
+        categoryType: customItem.categoryType,
+        brand:
+          customItem.brand ||
+          (customItem.platformGroup === 'ps' ? 'Sony PlayStation' : 'Xbox / Microsoft'),
+        image: customItem.image,
+        shortDescription: customItem.shortDescription,
+        featuredScore: 200,
+        priceRub: customItem.priceRub,
+        inStock: customItem.inStock,
+      };
+    }
+    return seoProductLookup.get(productId) || null;
+  }
+
+  function resolveAbsoluteAssetUrl(baseUrl: string, assetPath: string): string {
+    const normalized = assetPath.trim();
+    if (!normalized) return `${baseUrl}${SITE_LOGO_PATH}`;
+    if (/^https?:\/\//i.test(normalized)) return normalized;
+    return `${baseUrl}${normalized.startsWith('/') ? '' : '/'}${normalized}`;
+  }
+
+  function renderSeoHtml(htmlTemplate: string, req: Request): string {
+    const baseUrl = resolvePublicBaseUrl(req);
+    const parsed = parsePathname(req.path, '');
+    const seoProduct = parsed.productId ? findSeoProductById(parsed.productId) : null;
+
+    let title: string;
+    let description: string;
+    let canonicalPath: string;
+    let robots: string;
+    let ogType = 'website';
+    let ogImage = `${baseUrl}${SITE_LOGO_PATH}`;
+    let breadcrumbName: string | undefined;
+    const ldBlocks: Array<Record<string, unknown>> = [];
+    let fallbackHtml = '';
+
+    if (seoProduct) {
+      title = `${seoProduct.title} (${seoProduct.platformLabel}) — купить в CyberGameStore`;
+      description =
+        seoProduct.shortDescription ||
+        `Купить ${seoProduct.title} для ${seoProduct.platformLabel} за ${seoProduct.priceRub} ₽. Оформление за 5–15 минут в CyberGameStore.`;
+      canonicalPath = buildRoutePath('home', 'all', seoProduct.id);
+      robots = 'index, follow';
+      ogType = 'product';
+      ogImage = resolveAbsoluteAssetUrl(baseUrl, seoProduct.image);
+
+      const categoryPath =
+        seoProduct.categoryType === 'subscriptions'
+          ? '/subscriptions'
+          : seoProduct.platformGroup === 'ps'
+            ? '/playstation'
+            : '/xbox';
+      const categoryLabel =
+        seoProduct.categoryType === 'subscriptions'
+          ? 'Подписки'
+          : seoProduct.platformGroup === 'ps'
+            ? 'Игры PlayStation'
+            : 'Игры Xbox';
+
+      ldBlocks.push({
+        '@context': 'https://schema.org',
+        '@type': 'Product',
+        name: seoProduct.title,
+        image: ogImage,
+        description,
+        sku: seoProduct.id,
+        brand: {
+          '@type': 'Brand',
+          name: seoProduct.brand,
+        },
+        offers: {
+          '@type': 'Offer',
+          url: `${baseUrl}${canonicalPath}`,
+          priceCurrency: 'RUB',
+          price: seoProduct.priceRub,
+          availability: seoProduct.inStock
+            ? 'https://schema.org/InStock'
+            : 'https://schema.org/OutOfStock',
+          itemCondition: 'https://schema.org/NewCondition',
+          seller: {
+            '@type': 'Organization',
+            name: 'CyberGameStore',
+          },
+        },
+      });
+
+      ldBlocks.push({
+        '@context': 'https://schema.org',
+        '@type': 'BreadcrumbList',
+        itemListElement: [
+          { '@type': 'ListItem', position: 1, name: 'Главная', item: `${baseUrl}/` },
+          { '@type': 'ListItem', position: 2, name: categoryLabel, item: `${baseUrl}${categoryPath}` },
+          {
+            '@type': 'ListItem',
+            position: 3,
+            name: seoProduct.title,
+            item: `${baseUrl}${canonicalPath}`,
+          },
+        ],
+      });
+
+      fallbackHtml = [
+        '<main style="max-width:960px;margin:32px auto;padding:0 16px;font-family:sans-serif">',
+        `<nav aria-label="Хлебные крошки"><a href="/">Главная</a> / <a href="${escapeTelegramHtml(categoryPath)}">${escapeTelegramHtml(categoryLabel)}</a></nav>`,
+        `<h1>${escapeTelegramHtml(seoProduct.title)} — ${escapeTelegramHtml(seoProduct.platformLabel)}</h1>`,
+        `<p>Цена: <strong>${seoProduct.priceRub} ₽</strong> · ${seoProduct.inStock ? 'В наличии' : 'Под заказ'}</p>`,
+        `<p>${escapeTelegramHtml(description)}</p>`,
+        '</main>',
+      ].join('');
+    } else {
+      const seoMeta = getRouteSeoMetadata(parsed.route, parsed.platform);
+      title = seoMeta.title;
+      description = seoMeta.description;
+      canonicalPath = seoMeta.canonicalPath;
+      robots = parsed.productId ? 'noindex, follow' : seoMeta.robots;
+      breadcrumbName = seoMeta.breadcrumbName;
+
+      if (breadcrumbName) {
+        ldBlocks.push({
+          '@context': 'https://schema.org',
+          '@type': 'BreadcrumbList',
+          itemListElement: [
+            { '@type': 'ListItem', position: 1, name: 'Главная', item: `${baseUrl}/` },
+            {
+              '@type': 'ListItem',
+              position: 2,
+              name: breadcrumbName,
+              item: `${baseUrl}${canonicalPath}`,
+            },
+          ],
+        });
+      }
+
+      fallbackHtml = [
+        '<main style="max-width:960px;margin:32px auto;padding:0 16px;font-family:sans-serif">',
+        `<h1>${escapeTelegramHtml(breadcrumbName || 'CyberGameStore — игры Xbox и PlayStation (Турция)')}</h1>`,
+        `<p>${escapeTelegramHtml(description)}</p>`,
+        '<nav aria-label="Разделы каталога"><a href="/">Главная</a> · <a href="/xbox">Игры Xbox</a> · <a href="/playstation">Игры PlayStation</a> · <a href="/subscriptions">Подписки</a> · <a href="/delivery">Оплата и доставка</a></nav>',
+        '</main>',
+      ].join('');
+    }
+
+    const canonicalUrl = `${baseUrl}${canonicalPath}`;
+    let out = htmlTemplate;
+
+    out = out.replace(/<title>[\s\S]*?<\/title>/i, `<title>${escapeTelegramHtml(title)}</title>`);
+    out = out.replace(
+      /<meta\s+name="description"\s+content="[\s\S]*?"\s*\/>/i,
+      `<meta name="description" content="${escapeTelegramHtml(description)}" />`
+    );
+    out = out.replace(
+      /<meta\s+name="robots"\s+content="[\s\S]*?"\s*\/>/i,
+      `<meta name="robots" content="${escapeTelegramHtml(robots)}" />`
+    );
+    out = out.replace(
+      /<link\s+rel="canonical"\s+href="[\s\S]*?"\s*\/>/i,
+      `<link rel="canonical" href="${escapeTelegramHtml(canonicalUrl)}" />`
+    );
+    out = out.replace(
+      /<meta\s+property="og:type"\s+content="[\s\S]*?"\s*\/>/i,
+      `<meta property="og:type" content="${escapeTelegramHtml(ogType)}" />`
+    );
+    out = out.replace(
+      /<meta\s+property="og:title"\s+content="[\s\S]*?"\s*\/>/i,
+      `<meta property="og:title" content="${escapeTelegramHtml(title)}" />`
+    );
+    out = out.replace(
+      /<meta\s+property="og:description"\s+content="[\s\S]*?"\s*\/>/i,
+      `<meta property="og:description" content="${escapeTelegramHtml(description)}" />`
+    );
+    out = out.replace(
+      /<meta\s+property="og:url"\s+content="[\s\S]*?"\s*\/>/i,
+      `<meta property="og:url" content="${escapeTelegramHtml(canonicalUrl)}" />`
+    );
+    out = out.replace(
+      /<meta\s+property="og:image"\s+content="[\s\S]*?"\s*\/>/i,
+      `<meta property="og:image" content="${escapeTelegramHtml(ogImage)}" />`
+    );
+    out = out.replace(
+      /<meta\s+name="twitter:title"\s+content="[\s\S]*?"\s*\/>/i,
+      `<meta name="twitter:title" content="${escapeTelegramHtml(title)}" />`
+    );
+    out = out.replace(
+      /<meta\s+name="twitter:description"\s+content="[\s\S]*?"\s*\/>/i,
+      `<meta name="twitter:description" content="${escapeTelegramHtml(description)}" />`
+    );
+    out = out.replace(
+      /<meta\s+name="twitter:image"\s+content="[\s\S]*?"\s*\/>/i,
+      `<meta name="twitter:image" content="${escapeTelegramHtml(ogImage)}" />`
+    );
+
+    if (ldBlocks.length > 0) {
+      const ldScripts = ldBlocks
+        .map(
+          (block) =>
+            `<script id="cgs-dynamic-jsonld" type="application/ld+json">${JSON.stringify(block).replace(
+              /</g,
+              '\\u003c'
+            )}</script>`
+        )
+        .join('\n    ');
+      out = out.replace('</head>', `    ${ldScripts}\n  </head>`);
+    }
+
+    if (fallbackHtml) {
+      out = out.replace('<div id="root"></div>', `<div id="root">${fallbackHtml}</div>`);
+    }
+
+    return out;
+  }
+
+  app.get('/robots.txt', (req: Request, res: Response) => {
+    const baseUrl = resolvePublicBaseUrl(req);
+    const body = [
+      'User-agent: *',
+      'Allow: /',
+      'Disallow: /admin',
+      'Disallow: /api/',
+      '',
+      `Sitemap: ${baseUrl}/sitemap.xml`,
+      '',
+    ].join('\n');
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.send(body);
+  });
+
+  app.get('/sitemap.xml', (req: Request, res: Response) => {
+    const baseUrl = resolvePublicBaseUrl(req);
+    const mergedMap = new Map<string, { id: string; score: number }>();
+
+    for (const [id, rec] of seoProductLookup.entries()) {
+      mergedMap.set(id, { id, score: rec.featuredScore || 0 });
+    }
+    for (const [id, item] of customCatalogMap.entries()) {
+      if (item.isHidden) {
+        mergedMap.delete(id);
+      } else {
+        const prevScore = mergedMap.get(id)?.score ?? 200;
+        mergedMap.set(id, { id, score: prevScore });
+      }
+    }
+
+    const topProducts = Array.from(mergedMap.values())
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 1000);
+
+    const staticUrls: Array<{ path: string; changefreq: string; priority: string }> = [
+      { path: '/', changefreq: 'daily', priority: '1.0' },
+      { path: '/xbox', changefreq: 'daily', priority: '0.9' },
+      { path: '/playstation', changefreq: 'daily', priority: '0.9' },
+      { path: '/subscriptions', changefreq: 'daily', priority: '0.9' },
+      { path: '/catalog', changefreq: 'daily', priority: '0.8' },
+      { path: '/delivery', changefreq: 'weekly', priority: '0.7' },
+      { path: '/about', changefreq: 'monthly', priority: '0.6' },
+      { path: '/contacts', changefreq: 'monthly', priority: '0.6' },
+      { path: '/privacy', changefreq: 'yearly', priority: '0.3' },
+      { path: '/terms', changefreq: 'yearly', priority: '0.3' },
+    ];
+
+    const xmlEntries: string[] = [];
+    for (const entry of staticUrls) {
+      xmlEntries.push(
+        `  <url><loc>${escapeTelegramHtml(`${baseUrl}${entry.path}`)}</loc><changefreq>${entry.changefreq}</changefreq><priority>${entry.priority}</priority></url>`
+      );
+    }
+    for (const prod of topProducts) {
+      const loc = `${baseUrl}${buildRoutePath('home', 'all', prod.id)}`;
+      xmlEntries.push(
+        `  <url><loc>${escapeTelegramHtml(loc)}</loc><changefreq>weekly</changefreq><priority>0.7</priority></url>`
+      );
+    }
+
+    const xml = [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+      ...xmlEntries,
+      '</urlset>',
+      '',
+    ].join('\n');
+
+    res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=1800');
+    res.send(xml);
+  });
+
   if (process.env.NODE_ENV === 'production') {
     const distDir = path.resolve(__dirname, 'dist');
-    app.use(express.static(distDir));
-    app.get('*', (_req: Request, res: Response) => {
+    app.use(express.static(distDir, { index: false }));
+    app.get('*', (req: Request, res: Response) => {
       const indexFile = path.join(distDir, 'index.html');
       if (fs.existsSync(indexFile)) {
-        res.sendFile(indexFile);
+        const rawHtml = fs.readFileSync(indexFile, 'utf8');
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.send(renderSeoHtml(rawHtml, req));
       } else {
         res.status(404).send('Build not found');
       }
@@ -1255,6 +2073,38 @@ async function startServer() {
       server: { middlewareMode: true },
       appType: 'spa',
     });
+
+    app.get('*', async (req: Request, res: Response, next) => {
+      const reqPath = req.path || '/';
+      const accept = String(req.headers.accept || '');
+      const isHtmlRequest =
+        req.method === 'GET' &&
+        !reqPath.startsWith('/api/') &&
+        !reqPath.startsWith('/@') &&
+        !reqPath.startsWith('/src/') &&
+        !reqPath.startsWith('/node_modules/') &&
+        !reqPath.startsWith('/assets/') &&
+        !reqPath.startsWith('/catalog-data/') &&
+        !path.extname(reqPath) &&
+        (accept === '' || accept.includes('text/html') || accept.includes('*/*'));
+
+      if (!isHtmlRequest) {
+        next();
+        return;
+      }
+
+      try {
+        const templatePath = path.resolve(__dirname, 'index.html');
+        const rawTemplate = fs.readFileSync(templatePath, 'utf8');
+        const seoHtml = renderSeoHtml(rawTemplate, req);
+        const finalHtml = await vite.transformIndexHtml(req.originalUrl, seoHtml);
+        res.status(200).set({ 'Content-Type': 'text/html; charset=utf-8' }).end(finalHtml);
+      } catch (err) {
+        vite.ssrFixStacktrace(err as Error);
+        next(err);
+      }
+    });
+
     app.use(vite.middlewares);
   }
 

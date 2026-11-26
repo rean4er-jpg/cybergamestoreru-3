@@ -29,7 +29,8 @@ service cloud.firestore {
     }
 
     function isBootstrapAdmin() {
-      return isVerified() && request.auth.token.email == 'rean4er@gmail.com';
+      return isVerified()
+        && request.auth.token.email in ['rean4er@gmail.com', 'cybergamestoreru@gmail.com'];
     }
 
     function isAdmin() {
@@ -126,7 +127,9 @@ service cloud.firestore {
     // Storefront Catalog Products (publicly readable, zero PII, strictly admin-writable)
     match /products/{productId} {
       allow get: if isValidId(productId);
-      allow list: if resource.data.priceRub >= 1 || isBootstrapAdmin();
+      allow list: if resource.data.priceRub >= 1
+        || resource.data.updatedAt > timestamp.date(2020, 1, 1)
+        || isBootstrapAdmin();
 
       allow create: if isVerified()
         && isValidId(productId)

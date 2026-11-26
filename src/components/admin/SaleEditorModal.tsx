@@ -60,19 +60,24 @@ export function SaleEditorModal({
     setForm(initialSale ? { ...initialSale } : buildDefaultSale(catalogProducts));
     setProductSearch('');
     setError(null);
-  }, [isOpen, initialSale, catalogProducts]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, initialSale]);
 
   const matchingProducts = useMemo(() => {
     const q = productSearch.trim().toLowerCase();
     if (!q) return catalogProducts.slice(0, 40);
-    return catalogProducts
-      .filter(
-        (p) =>
-          p.title.toLowerCase().includes(q) ||
-          p.sku.toLowerCase().includes(q) ||
-          p.platformLabel.toLowerCase().includes(q)
-      )
-      .slice(0, 40);
+    const out: StoreProduct[] = [];
+    for (const p of catalogProducts) {
+      if (
+        p.title.toLowerCase().includes(q) ||
+        p.sku.toLowerCase().includes(q) ||
+        p.platformLabel.toLowerCase().includes(q)
+      ) {
+        out.push(p);
+        if (out.length >= 40) break;
+      }
+    }
+    return out;
   }, [catalogProducts, productSearch]);
 
   if (!isOpen) return null;

@@ -74,6 +74,7 @@ const GENRE_TRANSLATIONS: Record<string, string> = {
 
 const FEATURED_TITLE_SCORES: [RegExp, number][] = [
   [/xbox game pass ultimate/i, 100],
+  [/play\s*station\s*plus|\bps\s*plus\b/i, 99],
   [/^gta 6\b/i, 98],
   [/^forza horizon 6\b/i, 96],
   [/^battlefield 6\b/i, 95],
@@ -147,6 +148,14 @@ function cleanDisplayTitle(raw: RawCatalogItem, isSubscription: boolean): string
   if (isSubscription) {
     const durationMatch = t.match(/(\d+\s*(?:месяц(?:а|ев)?|мес\.?))/i);
     const duration = durationMatch ? durationMatch[1] : '';
+    const isPsPlus = raw.platform === 'PlayStation' || /ps\s*plus|playstation\s*plus/i.test(t);
+    if (isPsPlus) {
+      const tierMatch = t.match(/\b(Deluxe|Extra|Essential)\b/i);
+      const tier = tierMatch
+        ? tierMatch[1].charAt(0).toUpperCase() + tierMatch[1].slice(1).toLowerCase()
+        : '';
+      return `PlayStation Plus${tier ? ` ${tier}` : ''}${duration ? ` — ${duration}` : ''} (Турция)`;
+    }
     const hasPc = /ПК/i.test(t);
     return duration
       ? `Xbox Game Pass Ultimate — ${duration}${hasPc ? ' (Xbox + ПК)' : ''}`
@@ -207,6 +216,15 @@ function extractPlatformLabel(raw: RawCatalogItem, isSubscription: boolean): str
 function extractEditionLabel(cleanTitle: string, raw: RawCatalogItem, isSubscription: boolean): string {
   if (isSubscription) {
     const m = raw.title.match(/(\d+\s*месяц(?:а|ев)?)/i);
+    const isPsPlus = raw.platform === 'PlayStation' || /ps\s*plus|playstation\s*plus/i.test(raw.title);
+    if (isPsPlus) {
+      const tierMatch = raw.title.match(/\b(Deluxe|Extra|Essential)\b/i);
+      const tier = tierMatch
+        ? tierMatch[1].charAt(0).toUpperCase() + tierMatch[1].slice(1).toLowerCase()
+        : '';
+      const base = tier ? `PS Plus ${tier}` : 'PS Plus';
+      return m ? `${base} · ${m[1]}` : base;
+    }
     return m ? `Подписка ${m[1]}` : 'Подписка Ultimate';
   }
   const patterns: [RegExp, string][] = [
@@ -234,7 +252,11 @@ function extractEditionLabel(cleanTitle: string, raw: RawCatalogItem, isSubscrip
 }
 
 function extractSeriesKey(cleanTitle: string, isSubscription: boolean): string {
-  if (isSubscription) return 'xbox-game-pass-ultimate';
+  if (isSubscription) {
+    return /ps\s*plus|playstation\s*plus/i.test(cleanTitle)
+      ? 'playstation-plus'
+      : 'xbox-game-pass-ultimate';
+  }
   return cleanTitle
     .toLowerCase()
     .replace(/['’`]/g, '')
@@ -351,20 +373,33 @@ function cleanDescription(raw: RawCatalogItem): { shortDesc: string; fullDesc: s
     text = text.slice(raw.title.length).replace(/^[\s.]+/, '').trim();
   }
 
-  // Strip trailing boilerplate "Инструкция:1. Скопируйте код..."
+  // Replace "no account data required" subscription boilerplate so customers know personal account top-up is available
+  text = text.replace(
+    /^(?:Подписка\s+Ps\s+Plus\s+Турция\s*)?Никакие\s+данные\s+от\s+ваших\s+аккаунтов\s+не\s+просим\..*?Все\s+сохранения\s+и\s+достижения\s+у\s+вас\s+будут\s+работать\s+на\s+старом\s+аккаунте!\s*/i,
+    'Оформляем подписку прямо на ваш личный аккаунт или с выдачей готового профиля на выбор. '
+  );
+
+  // Strip trailing email-code boilerplate ("Инструкция:1. Скопируйте код с почты...")
   text = text.replace(/\s*Инструкция:\s*1\..*$/i, '').trim();
 
-  // Tidy repeated whitespace
-  text = text.replace(/\s{2,}/g, ' ').trim();
+  // Remove any remaining mentions of contacting via email in raw descriptions
+  text = text
+    .replace(/(?:на\s+)?электронную?\s+почт[уые]|по\s+email|через\s+e-?mail/gi, 'в Telegram (https://t.me/GyberGameStore)')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
 
   if (!text) {
-    text = raw.description.trim();
+    text = 'Быстрое официальное оформление за 5–15 минут.';
   }
 
   const shortDesc =
     text.length > 155 ? `${text.slice(0, 152).replace(/[\s,.;:]+$/, '')}…` : text;
 
-  return { shortDesc, fullDesc: text };
+  const fullDesc = /t\.me\/GyberGameStore/i.test(text)
+    ? text
+    : `${text}\n\nСвязь и оформление заказа в Telegram: https://t.me/GyberGameStore`;
+
+  return { shortDesc, fullDesc };
 }
 
 function buildActivationSteps(
@@ -372,29 +407,37 @@ function buildActivationSteps(
   deliveryType: 'account' | 'key' | 'subscription'
 ): string[] {
   if (deliveryType === 'subscription') {
+    const accountTarget =
+      platformGroup === 'ps'
+        ? 'Мы можем приобрести и активировать подписку PlayStation Plus прямо на ваш личный аккаунт PlayStation либо выдать новый готовый аккаунт по вашему выбору.'
+        : 'Мы можем приобрести и активировать подписку Xbox Game Pass Ultimate прямо на ваш личный аккаунт Microsoft либо выдать новый готовый аккаунт по вашему выбору.';
+    const playStep =
+      platformGroup === 'ps'
+        ? 'Если выбран готовый аккаунт — включите «Общий доступ к консоли» на PS4/PS5 и играйте со своего основного профиля (все сохранения и трофеи сохраняются).'
+        : 'После активации используйте подписку на своём аккаунте или включите «Домашнюю консоль» на Xbox и играйте с основного профиля без VPN.';
     return [
-      'Оформите заказ в корзине и оставьте Telegram или Email для получения данных.',
-      'Мы выдаём готовый аккаунт с активной подпиской Xbox Game Pass Ultimate — данные от вашего личного профиля не требуются.',
-      'Войдите в выданный профиль на консоли Xbox, включите функцию «Домашняя консоль» и играйте со своего основного российского аккаунта без VPN.',
+      'Оформите заказ в корзине и укажите ваш Telegram (@username) или напишите сразу менеджеру: https://t.me/GyberGameStore.',
+      accountTarget,
+      playStep,
     ];
   }
   if (deliveryType === 'key') {
     return [
-      'Оформите заказ в корзине и укажите контакт для связи (Telegram или Email).',
-      'Менеджер отправит официальный цифровой ключ активации Xbox и пошаговую инструкцию (или поможет активировать ключ на ваш аккаунт).',
+      'Оформите заказ в корзине и укажите ваш Telegram (@username) или напишите менеджеру: https://t.me/GyberGameStore.',
+      'Менеджер отправит официальный цифровой ключ активации Xbox в Telegram и при необходимости поможет активировать ключ на ваш аккаунт.',
       'Игра закрепляется за вашим личным аккаунтом Microsoft навсегда и доступна для загрузки с консоли.',
     ];
   }
   if (platformGroup === 'ps') {
     return [
-      'При оформлении заказа укажите данные вашего турецкого аккаунта PlayStation или выберите бесплатную помощь с созданием нового профиля.',
-      'Мы официально оплачиваем игру в турецком PlayStation Store за 5–15 минут и отправляем подтверждение покупки.',
+      'При оформлении заказа укажите ваш Telegram (@username) или напишите менеджеру: https://t.me/GyberGameStore. Если турецкого аккаунта PlayStation ещё нет — бесплатно поможем создать.',
+      'Мы официально оплачиваем игру в турецком PlayStation Store за 5–15 минут и отправляем подтверждение покупки в Telegram.',
       'Включите «Общий доступ к консоли» на PS5/PS4 и играйте со своего основного российского аккаунта со всеми трофеями.',
     ];
   }
   return [
-    'Оформите заказ в корзине и укажите контакт для связи (Telegram или Email).',
-    'Мы официально приобретаем игру на ваш аккаунт Microsoft (подходит любой аккаунт Xbox) за 5–15 минут.',
+    'Оформите заказ в корзине и укажите ваш Telegram (@username) или напишите менеджеру: https://t.me/GyberGameStore.',
+    'Мы официально приобретаем игру на ваш аккаунт Microsoft (подходит любой аккаунт Xbox) за 5–15 минут и сообщаем о готовности в Telegram.',
     'После подтверждения скачайте игру из вашей библиотеки на консоль и играйте без ограничений.',
   ];
 }
@@ -446,7 +489,9 @@ export function mapRawToProduct(raw: RawCatalogItem): StoreProduct {
   const { shortDesc, fullDesc } = cleanDescription(raw);
 
   const regionLabel = isSubscription
-    ? 'Россия, без ВПН'
+    ? platformGroup === 'ps'
+      ? 'Турция'
+      : 'Россия, без ВПН'
     : raw.region === 'Турция'
       ? 'Турция'
       : raw.region === 'Global'
@@ -457,7 +502,7 @@ export function mapRawToProduct(raw: RawCatalogItem): StoreProduct {
 
   const deliveryLabel =
     deliveryType === 'subscription'
-      ? 'Готовый аккаунт с подпиской'
+      ? 'На ваш аккаунт или готовый профиль'
       : deliveryType === 'key'
         ? 'Ключ на ваш аккаунт'
         : platformGroup === 'ps'
@@ -479,7 +524,7 @@ export function mapRawToProduct(raw: RawCatalogItem): StoreProduct {
     deliveryType === 'key'
       ? 'Цифровой ключ · 5–15 мин'
       : deliveryType === 'subscription'
-        ? 'Выдача аккаунта с подпиской · 5–15 мин'
+        ? 'Оформление подписки · 5–15 мин'
         : platformGroup === 'ps'
           ? 'Покупка в турецком PS Store · 5–15 мин'
           : 'Оформление на аккаунт Xbox · 5–15 мин';
@@ -580,7 +625,7 @@ export const FAQ_ITEMS: FaqItem[] = [
     id: 'faq-new-account',
     question: 'Что делать, если у меня ещё нет турецкого аккаунта PlayStation или Xbox?',
     answer:
-      'При оформлении заказа отметьте в корзине пункт «Нужно помочь создать турецкий аккаунт». Мы бесплатно зарегистрируем личный турецкий профиль на вашу электронную почту, включим защиту и купим на него выбранную игру.',
+      'При оформлении заказа отметьте в корзине пункт «Нужно помочь создать турецкий аккаунт». Мы бесплатно зарегистрируем личный турецкий профиль, передадим данные в Telegram (@GyberGameStore) и купим на него выбранную игру или подписку.',
   },
   {
     id: 'faq-russian-profile',

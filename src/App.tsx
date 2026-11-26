@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { collection, getDocs, query, where } from 'firebase/firestore';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { collection, onSnapshot, query, Timestamp, where } from 'firebase/firestore';
 import {
   ArrowRight,
   ChevronDown,
@@ -21,38 +21,78 @@ import {
 import {
   combineProductOverrides,
   computeCatalogStats,
+  DEFAULT_DELTA_CUTOFF_ISO,
+  loadStaticExtraCatalog,
   mergeCatalogProducts,
   type FirestoreProductDoc,
 } from './data/adminCatalog';
-import { db, withTimeout } from './firebase';
+import { db, isQuotaExceededError } from './firebase';
 import { Header, type AppRoute } from './components/Header';
 import { ResilientImage } from './components/ResilientImage';
 import { ProductModal } from './components/ProductModal';
 import { LegalViews } from './components/LegalViews';
 import { CartDrawer, type CartItem } from './components/CartDrawer';
 import { PaymentModal, type OrderReceipt } from './components/PaymentModal';
+import { MyOrdersModal } from './components/MyOrdersModal';
 import { AdminPanel } from './components/admin/AdminPanel';
+import { loadSavedOrders, upsertSavedOrder } from './data/orderHistory';
+import {
+  buildRoutePath,
+  getRouteSeoMetadata,
+  parsePathname,
+  SITE_LOGO_PATH,
+  type SeoPlatformFilter,
+} from './data/seoRoutes';
 
 type SortOption = 'featured' | 'price-asc' | 'price-desc' | 'discount' | 'title-asc';
 type PriceRangeFilter = 'all' | 'under-2000' | '2000-5000' | 'over-5000';
 
 const ITEMS_PER_PAGE = 24;
 
-function resolveInitialRoute(): AppRoute {
-  if (typeof window === 'undefined') return 'home';
-  if (window.location.pathname.startsWith('/admin') || window.location.hash === '#admin') {
-    return 'admin';
+function getInitialParsedUrl() {
+  if (typeof window === 'undefined') {
+    return { route: 'home' as AppRoute, platform: 'all' as PlatformFilter, productId: undefined };
   }
-  return 'home';
+  return parsePathname(window.location.pathname, window.location.hash);
+}
+
+function setHeadMetaTag(attr: 'name' | 'property', key: string, content: string) {
+  if (typeof document === 'undefined') return;
+  let el = document.head.querySelector(`meta[${attr}="${key}"]`) as HTMLMetaElement | null;
+  if (!el) {
+    el = document.createElement('meta');
+    el.setAttribute(attr, key);
+    document.head.appendChild(el);
+  }
+  el.setAttribute('content', content);
+}
+
+function setCanonicalLink(href: string) {
+  if (typeof document === 'undefined') return;
+  let el = document.head.querySelector('link[rel="canonical"]') as HTMLLinkElement | null;
+  if (!el) {
+    el = document.createElement('link');
+    el.setAttribute('rel', 'canonical');
+    document.head.appendChild(el);
+  }
+  el.setAttribute('href', href);
 }
 
 export default function App() {
-  const [route, setRoute] = useState<AppRoute>(resolveInitialRoute);
+  const initialParsed = useMemo(() => getInitialParsedUrl(), []);
+  const [route, setRoute] = useState<AppRoute>(initialParsed.route);
+  const [staticExtraProducts, setStaticExtraProducts] = useState<StoreProduct[]>([]);
+  const [staticExtraIdSet, setStaticExtraIdSet] = useState<Set<string>>(() => new Set());
+  const [deltaCutoffIso, setDeltaCutoffIso] = useState<string>(DEFAULT_DELTA_CUTOFF_ISO);
   const [firestoreProducts, setFirestoreProducts] = useState<FirestoreProductDoc[]>([]);
   const [serverProducts, setServerProducts] = useState<FirestoreProductDoc[]>([]);
   const [activeProduct, setActiveProduct] = useState<StoreProduct | null>(null);
+  const [pendingUrlProductId, setPendingUrlProductId] = useState<string | null>(
+    initialParsed.productId || null
+  );
 
-  const [platformFilter, setPlatformFilter] = useState<PlatformFilter>('all');
+  const [platformFilter, setPlatformFilter] = useState<PlatformFilter>(initialParsed.platform);
+  const latestPlatformRef = useRef<SeoPlatformFilter>(initialParsed.platform);
   const [formatFilter, setFormatFilter] = useState<DeliveryFormatFilter>('all');
   const [priceRange, setPriceRange] = useState<PriceRangeFilter>('all');
   const [onlyRussian, setOnlyRussian] = useState(false);
@@ -66,6 +106,23 @@ export default function App() {
   const [cartItems, setCartItems] = useState<CartItem[]>([]);
   const [lastAddedTitle, setLastAddedTitle] = useState<string | null>(null);
   const [activeOrder, setActiveOrder] = useState<OrderReceipt | null>(null);
+  const [savedOrders, setSavedOrders] = useState<OrderReceipt[]>(() => loadSavedOrders());
+  const [myOrdersOpen, setMyOrdersOpen] = useState(false);
+  const [recentPaidBannerId, setRecentPaidBannerId] = useState<string | null>(null);
+
+  const recordOrder = useCallback((order: OrderReceipt) => {
+    setSavedOrders((prev) => upsertSavedOrder(prev, order));
+  }, []);
+
+  const recordOrdersBatch = useCallback((ordersToSave: OrderReceipt[]) => {
+    setSavedOrders((prev) => {
+      let next = prev;
+      for (const ord of ordersToSave) {
+        next = upsertSavedOrder(next, ord);
+      }
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -77,7 +134,9 @@ export default function App() {
       .then((res) => (res.ok ? res.json() : null))
       .then((order: OrderReceipt | null) => {
         if (order) {
-          setActiveOrder({ ...order, accessToken: token });
+          const withToken = { ...order, accessToken: token };
+          setActiveOrder(withToken);
+          recordOrder(withToken);
           if (order.status === 'paid') {
             setCartItems([]);
           }
@@ -89,42 +148,88 @@ export default function App() {
       .finally(() => {
         window.history.replaceState({}, '', window.location.pathname);
       });
+  }, [recordOrder]);
+
+  useEffect(() => {
+    const syncRoute = () => {
+      const parsed = parsePathname(window.location.pathname, window.location.hash);
+      setRoute(parsed.route);
+      latestPlatformRef.current = parsed.platform;
+      if (parsed.route === 'catalog' || parsed.route === 'home') {
+        setPlatformFilter(parsed.platform);
+      }
+      if (parsed.productId) {
+        setPendingUrlProductId(parsed.productId);
+      } else {
+        setPendingUrlProductId(null);
+        setActiveProduct(null);
+      }
+    };
+    window.addEventListener('hashchange', syncRoute);
+    window.addEventListener('popstate', syncRoute);
+    return () => {
+      window.removeEventListener('hashchange', syncRoute);
+      window.removeEventListener('popstate', syncRoute);
+    };
   }, []);
 
   const refreshServerProducts = useCallback(async () => {
     try {
       const res = await fetch('/api/catalog/custom');
-      if (!res.ok) return;
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok || !contentType.includes('application/json')) return;
       const data = (await res.json()) as { products?: FirestoreProductDoc[] };
       if (Array.isArray(data.products)) {
         setServerProducts(data.products);
       }
     } catch {
-      // Non-fatal: static catalog remains available
+      // Non-fatal: static hosting or offline backend falls back to Firestore + static catalog
     }
   }, []);
 
-  // Load server-persisted custom/imported catalog on mount
+  // Load server-persisted custom/imported catalog on mount (when Node backend is running)
   useEffect(() => {
     void refreshServerProducts();
   }, [refreshServerProducts]);
 
-  // One-shot bounded load of any legacy Firestore product overrides (prevents backoff loops if quota is exceeded)
+  // Load 27k pre-built static catalog chunks in parallel (0 Firestore reads)
   useEffect(() => {
     let cancelled = false;
-    const q = query(collection(db, 'products'), where('priceRub', '>=', 1));
-    void withTimeout(getDocs(q), 5000)
-      .then((snapshot) => {
-        if (cancelled) return;
-        setFirestoreProducts(snapshot.docs.map((d) => d.data() as FirestoreProductDoc));
-      })
-      .catch(() => {
-        // Ignore quota or transient offline errors; server catalog and static catalog stay active
-      });
+    void loadStaticExtraCatalog().then((loaded) => {
+      if (cancelled) return;
+      if (loaded.products.length > 0) {
+        setStaticExtraProducts(loaded.products);
+        setStaticExtraIdSet(loaded.idSet);
+      }
+      if (loaded.deltaCutoffIso) {
+        setDeltaCutoffIso(loaded.deltaCutoffIso);
+      }
+    });
     return () => {
       cancelled = true;
     };
   }, []);
+
+  // Real-time stream ONLY for delta Firestore overrides & newly added items after cutoff
+  useEffect(() => {
+    const parsedMs = Date.parse(deltaCutoffIso);
+    const cutoffTs = Timestamp.fromDate(
+      new Date(Number.isFinite(parsedMs) ? parsedMs : Date.parse(DEFAULT_DELTA_CUTOFF_ISO))
+    );
+    const q = query(collection(db, 'products'), where('updatedAt', '>', cutoffTs));
+    const unsubscribe = onSnapshot(
+      q,
+      (snapshot) => {
+        setFirestoreProducts(snapshot.docs.map((d) => d.data() as FirestoreProductDoc));
+      },
+      (err) => {
+        if (!isQuotaExceededError(err)) {
+          console.warn('Public products snapshot notice:', err);
+        }
+      }
+    );
+    return () => unsubscribe();
+  }, [deltaCutoffIso]);
 
   const combinedOverrides = useMemo(
     () => combineProductOverrides(firestoreProducts, serverProducts),
@@ -132,14 +237,156 @@ export default function App() {
   );
 
   const storefrontProducts = useMemo(
-    () => mergeCatalogProducts(combinedOverrides, false),
-    [combinedOverrides]
+    () =>
+      mergeCatalogProducts(
+        combinedOverrides,
+        false,
+        staticExtraProducts,
+        staticExtraIdSet
+      ),
+    [combinedOverrides, staticExtraProducts, staticExtraIdSet]
   );
 
   const catalogStats = useMemo(
     () => computeCatalogStats(storefrontProducts),
     [storefrontProducts]
   );
+
+  // Resolve /game/:id deep link once catalog products are ready
+  useEffect(() => {
+    if (!pendingUrlProductId || storefrontProducts.length === 0) return;
+    const match = storefrontProducts.find((p) => p.id === pendingUrlProductId);
+    if (match) {
+      setActiveProduct(match);
+      setPendingUrlProductId(null);
+    }
+  }, [pendingUrlProductId, storefrontProducts]);
+
+  // Dynamically update document <head> SEO tags, canonical URL, OG image, and Product/Breadcrumb JSON-LD
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const origin = window.location.origin;
+    const defaultImage = `${origin}${SITE_LOGO_PATH}`;
+
+    if (activeProduct) {
+      const firstVariant = activeProduct.variants[0];
+      const minPrice = activeProduct.variants.reduce(
+        (min, v) => (v.priceRub < min ? v.priceRub : min),
+        firstVariant?.priceRub || 0
+      );
+      const title = `${activeProduct.title} (${activeProduct.platformLabel}) — купить | CyberGameStore`;
+      const descSource =
+        activeProduct.shortDescription ||
+        `${activeProduct.title} для ${activeProduct.platformLabel} на турецкий аккаунт за ${minPrice.toLocaleString('ru-RU')} ₽. Быстрая официальная доставка за 5–15 минут.`;
+      const description = descSource.length > 160 ? `${descSource.slice(0, 157)}...` : descSource;
+      const canonicalUrl = `${origin}${buildRoutePath('home', 'all', activeProduct.id)}`;
+      const ogImage = activeProduct.image?.startsWith('http')
+        ? activeProduct.image
+        : activeProduct.image?.startsWith('/')
+          ? `${origin}${activeProduct.image}`
+          : defaultImage;
+
+      document.title = title;
+      setHeadMetaTag('name', 'description', description);
+      setHeadMetaTag('name', 'robots', 'index, follow');
+      setCanonicalLink(canonicalUrl);
+      setHeadMetaTag('property', 'og:type', 'product');
+      setHeadMetaTag('property', 'og:title', title);
+      setHeadMetaTag('property', 'og:description', description);
+      setHeadMetaTag('property', 'og:url', canonicalUrl);
+      setHeadMetaTag('property', 'og:image', ogImage);
+      setHeadMetaTag('name', 'twitter:title', title);
+      setHeadMetaTag('name', 'twitter:description', description);
+      setHeadMetaTag('name', 'twitter:image', ogImage);
+
+      const catPath =
+        activeProduct.categoryType === 'subscriptions'
+          ? '/subscriptions'
+          : activeProduct.platformGroup === 'ps'
+            ? '/playstation'
+            : '/xbox';
+      const catName =
+        activeProduct.categoryType === 'subscriptions'
+          ? 'Подписки'
+          : activeProduct.platformGroup === 'ps'
+            ? 'Игры PlayStation'
+            : 'Игры Xbox';
+
+      let ldScript = document.getElementById('cgs-dynamic-jsonld') as HTMLScriptElement | null;
+      if (!ldScript) {
+        ldScript = document.createElement('script');
+        ldScript.id = 'cgs-dynamic-jsonld';
+        ldScript.type = 'application/ld+json';
+        document.head.appendChild(ldScript);
+      }
+      ldScript.textContent = JSON.stringify({
+        '@context': 'https://schema.org',
+        '@graph': [
+          {
+            '@type': 'Product',
+            name: activeProduct.title,
+            description,
+            image: ogImage,
+            sku: activeProduct.id,
+            brand: { '@type': 'Brand', name: activeProduct.brand || activeProduct.platformLabel },
+            offers: {
+              '@type': 'Offer',
+              url: canonicalUrl,
+              priceCurrency: 'RUB',
+              price: String(minPrice),
+              availability: activeProduct.variants.some((v) => v.inStock)
+                ? 'https://schema.org/InStock'
+                : 'https://schema.org/OutOfStock',
+            },
+          },
+          {
+            '@type': 'BreadcrumbList',
+            itemListElement: [
+              { '@type': 'ListItem', position: 1, name: 'Главная', item: `${origin}/` },
+              { '@type': 'ListItem', position: 2, name: catName, item: `${origin}${catPath}` },
+              { '@type': 'ListItem', position: 3, name: activeProduct.title, item: canonicalUrl },
+            ],
+          },
+        ],
+      });
+      return;
+    }
+
+    const meta = getRouteSeoMetadata(route, platformFilter);
+    const canonicalUrl = `${origin}${meta.canonicalPath}`;
+    document.title = meta.title;
+    setHeadMetaTag('name', 'description', meta.description);
+    setHeadMetaTag('name', 'robots', meta.robots);
+    setCanonicalLink(canonicalUrl);
+    setHeadMetaTag('property', 'og:type', 'website');
+    setHeadMetaTag('property', 'og:title', meta.title);
+    setHeadMetaTag('property', 'og:description', meta.description);
+    setHeadMetaTag('property', 'og:url', canonicalUrl);
+    setHeadMetaTag('property', 'og:image', defaultImage);
+    setHeadMetaTag('name', 'twitter:title', meta.title);
+    setHeadMetaTag('name', 'twitter:description', meta.description);
+    setHeadMetaTag('name', 'twitter:image', defaultImage);
+
+    let ldScript = document.getElementById('cgs-dynamic-jsonld') as HTMLScriptElement | null;
+    if (meta.breadcrumbName) {
+      if (!ldScript) {
+        ldScript = document.createElement('script');
+        ldScript.id = 'cgs-dynamic-jsonld';
+        ldScript.type = 'application/ld+json';
+        document.head.appendChild(ldScript);
+      }
+      ldScript.textContent = JSON.stringify({
+        '@context': 'https://schema.org',
+        '@type': 'BreadcrumbList',
+        itemListElement: [
+          { '@type': 'ListItem', position: 1, name: 'Главная', item: `${origin}/` },
+          { '@type': 'ListItem', position: 2, name: meta.breadcrumbName, item: canonicalUrl },
+        ],
+      });
+    } else if (ldScript) {
+      ldScript.remove();
+    }
+  }, [route, platformFilter, activeProduct]);
 
   // Reset pagination whenever filters or sort change
   useEffect(() => {
@@ -148,14 +395,20 @@ export default function App() {
 
   const handleNavigate = (nextRoute: AppRoute, sectionId?: string) => {
     setRoute(nextRoute);
+    setActiveProduct(null);
+    setPendingUrlProductId(null);
+
     if (nextRoute === 'admin') {
-      window.history.replaceState({}, '', '#admin');
+      window.history.pushState({}, '', '/admin');
       window.scrollTo({ top: 0, behavior: 'auto' });
       return;
     }
-    if (window.location.hash === '#admin' || window.location.pathname.startsWith('/admin')) {
-      window.history.replaceState({}, '', '/');
+
+    const nextPath = buildRoutePath(nextRoute, latestPlatformRef.current);
+    if (window.location.pathname !== nextPath || window.location.hash) {
+      window.history.pushState({}, '', nextPath);
     }
+
     if (sectionId) {
       setTimeout(() => {
         const el = document.getElementById(sectionId);
@@ -169,8 +422,33 @@ export default function App() {
   };
 
   const handleSelectPlatform = (platform: PlatformFilter) => {
+    latestPlatformRef.current = platform;
     setPlatformFilter(platform);
     setFormatFilter('all');
+    if (route === 'home' || route === 'catalog') {
+      const nextPath = buildRoutePath(route, platform);
+      if (window.location.pathname !== nextPath) {
+        window.history.pushState({}, '', nextPath);
+      }
+    }
+  };
+
+  const openProductModal = (product: StoreProduct) => {
+    setPendingUrlProductId(null);
+    setActiveProduct(product);
+    const nextPath = buildRoutePath(route, latestPlatformRef.current, product.id);
+    if (window.location.pathname !== nextPath) {
+      window.history.pushState({}, '', nextPath);
+    }
+  };
+
+  const closeProductModal = () => {
+    setPendingUrlProductId(null);
+    setActiveProduct(null);
+    const backPath = buildRoutePath(route, latestPlatformRef.current);
+    if (window.location.pathname !== backPath) {
+      window.history.pushState({}, '', backPath);
+    }
   };
 
   const resetAllFilters = () => {
@@ -339,7 +617,7 @@ export default function App() {
     if (formatFilter === 'preorder') return 'Предзаказы 2025–2026';
     if (platformFilter === 'xbox') return 'Игры для Xbox One и Series X|S';
     if (platformFilter === 'ps') return 'Игры для PlayStation 5 (Турция)';
-    if (platformFilter === 'subscriptions') return 'Подписки Xbox Game Pass Ultimate';
+    if (platformFilter === 'subscriptions') return 'Подписки PS Plus и Xbox Game Pass';
     return 'Каталог игр и подписок';
   }, [platformFilter, formatFilter]);
 
@@ -473,7 +751,7 @@ export default function App() {
                       <div className="relative aspect-[4/3] w-full overflow-hidden bg-neutral-900">
                         <button
                           type="button"
-                          onClick={() => setActiveProduct(product)}
+                          onClick={() => openProductModal(product)}
                           className="w-full h-full block text-left cursor-pointer"
                         >
                           <ResilientImage
@@ -481,19 +759,20 @@ export default function App() {
                             alt={product.title}
                             title={product.title}
                             fallbackTone={product.fallbackTone}
-                            className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
+                            className="w-full h-full"
+                            imgClassName="transition-transform duration-300 group-hover:scale-[1.03]"
                           />
                         </button>
                         {hasDiscount ? (
-                          <span className="absolute top-2.5 left-2.5 px-2.5 py-1 text-[11px] font-bold text-black bg-[#52c44c] rounded-md tabular-nums">
+                          <span className="absolute top-2.5 left-2.5 z-10 px-2.5 py-1 text-[11px] font-bold text-black bg-[#52c44c] rounded-md tabular-nums">
                             Скидка -{defaultVariant.discountPercent}%
                           </span>
                         ) : product.isPreorder ? (
-                          <span className="absolute top-2.5 left-2.5 px-2.5 py-1 text-[11px] font-bold text-white bg-black/85 border border-neutral-700 rounded-md">
+                          <span className="absolute top-2.5 left-2.5 z-10 px-2.5 py-1 text-[11px] font-bold text-white bg-black/85 border border-neutral-700 rounded-md">
                             Предзаказ
                           </span>
                         ) : product.deliveryType === 'key' ? (
-                          <span className="absolute top-2.5 left-2.5 px-2.5 py-1 text-[11px] font-semibold text-white bg-black/80 rounded-md">
+                          <span className="absolute top-2.5 left-2.5 z-10 px-2.5 py-1 text-[11px] font-semibold text-white bg-black/80 rounded-md">
                             Ключ Xbox
                           </span>
                         ) : null}
@@ -513,7 +792,7 @@ export default function App() {
                           <h3 className="text-sm sm:text-[15px] font-semibold text-neutral-900 leading-snug line-clamp-2 min-h-[2.6rem]">
                             <button
                               type="button"
-                              onClick={() => setActiveProduct(product)}
+                              onClick={() => openProductModal(product)}
                               className="text-left hover:text-[#52c44c] transition-colors cursor-pointer"
                             >
                               {product.title}
@@ -719,7 +998,7 @@ export default function App() {
                       : 'text-neutral-700 hover:text-[#52c44c]'
                   }`}
                 >
-                  <span>Подписки Game Pass</span>
+                  <span>Подписки PS Plus / Game Pass</span>
                   <span className="font-mono text-xs text-neutral-400 tabular-nums">
                     {catalogStats.subscriptions}
                   </span>
@@ -870,6 +1149,8 @@ export default function App() {
   if (route === 'admin') {
     return (
       <AdminPanel
+        staticExtraProducts={staticExtraProducts}
+        staticExtraIdSet={staticExtraIdSet}
         firestoreProducts={firestoreProducts}
         serverProducts={serverProducts}
         onRefreshServerProducts={refreshServerProducts}
@@ -884,10 +1165,38 @@ export default function App() {
         activeRoute={route}
         activePlatform={platformFilter}
         cartCount={cartCount}
+        savedOrdersCount={savedOrders.length}
         onNavigate={handleNavigate}
         onSelectPlatform={handleSelectPlatform}
         onOpenCart={() => setCartOpen(true)}
+        onOpenMyOrders={() => setMyOrdersOpen(true)}
       />
+
+      {recentPaidBannerId && !activeOrder && (
+        <div className="bg-[#111111] text-white text-xs py-2.5 px-4 text-center border-b border-neutral-800 flex flex-wrap items-center justify-center gap-2">
+          <span className="text-neutral-200">
+            Покупка <strong className="font-mono text-[#52c44c]">#{recentPaidBannerId}</strong>{' '}
+            сохранена в разделе «Мои покупки».
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              setRecentPaidBannerId(null);
+              setMyOrdersOpen(true);
+            }}
+            className="text-[#52c44c] underline font-semibold hover:text-white cursor-pointer"
+          >
+            Открыть чек
+          </button>
+          <button
+            type="button"
+            onClick={() => setRecentPaidBannerId(null)}
+            className="text-neutral-400 hover:text-white ml-1 cursor-pointer"
+          >
+            Скрыть
+          </button>
+        </div>
+      )}
 
       {lastAddedTitle && !cartOpen && (
         <div className="bg-[#141414] text-white text-xs py-2 px-4 text-center border-b border-neutral-800">
@@ -957,7 +1266,7 @@ export default function App() {
                   </h2>
                   <p className="text-sm text-neutral-600 leading-relaxed">
                     Добавьте нужные позиции для PlayStation или Xbox в корзину. Если турецкого
-                    профиля ещё нет — бесплатно поможем зарегистрировать его на вашу почту.
+                    профиля ещё нет — бесплатно поможем зарегистрировать его и передадим данные в Telegram.
                   </p>
                 </div>
 
@@ -1142,6 +1451,15 @@ export default function App() {
                 <li>
                   <button
                     type="button"
+                    onClick={() => setMyOrdersOpen(true)}
+                    className="hover:text-[#52c44c] transition-colors cursor-pointer"
+                  >
+                    Мои покупки{savedOrders.length > 0 ? ` (${savedOrders.length})` : ''}
+                  </button>
+                </li>
+                <li>
+                  <button
+                    type="button"
                     onClick={() => handleNavigate('admin')}
                     className="text-[#52c44c] hover:underline transition-colors cursor-pointer"
                   >
@@ -1230,30 +1548,47 @@ export default function App() {
       <ProductModal
         product={activeProduct}
         allProducts={storefrontProducts}
-        onClose={() => setActiveProduct(null)}
-        onSelectProduct={(nextProduct) => setActiveProduct(nextProduct)}
+        onClose={closeProductModal}
+        onSelectProduct={(nextProduct) => openProductModal(nextProduct)}
         onAddToCart={handleAddToCart}
       />
 
       <CartDrawer
         isOpen={cartOpen}
         items={cartItems}
+        savedOrders={savedOrders}
         onClose={() => setCartOpen(false)}
         onUpdateQty={handleUpdateQty}
         onRemoveItem={handleRemoveItem}
         onClearCart={() => setCartItems([])}
         onOpenPaymentModal={(order) => setActiveOrder(order)}
+        onOrderSaved={recordOrder}
+        onOpenMyOrders={() => setMyOrdersOpen(true)}
       />
 
       <PaymentModal
         order={activeOrder}
-        onClose={() => setActiveOrder(null)}
+        onClose={() => {
+          if (activeOrder?.status === 'paid') {
+            setRecentPaidBannerId(activeOrder.id);
+          }
+          setActiveOrder(null);
+        }}
         onOrderUpdated={(updated) => {
           setActiveOrder(updated);
+          recordOrder(updated);
           if (updated.status === 'paid') {
             setCartItems([]);
           }
         }}
+      />
+
+      <MyOrdersModal
+        isOpen={myOrdersOpen}
+        orders={savedOrders}
+        onClose={() => setMyOrdersOpen(false)}
+        onSelectOrder={(order) => setActiveOrder(order)}
+        onOrdersSynced={recordOrdersBatch}
       />
     </div>
   );

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Menu, ShoppingBag, X } from 'lucide-react';
+import { Menu, Receipt, ShoppingBag, X } from 'lucide-react';
 import type { PlatformFilter } from '../data/storeData';
 
 export type AppRoute =
@@ -16,18 +16,22 @@ interface HeaderProps {
   activeRoute: AppRoute;
   activePlatform?: PlatformFilter;
   cartCount: number;
+  savedOrdersCount: number;
   onNavigate: (route: AppRoute, sectionId?: string) => void;
   onSelectPlatform: (platform: PlatformFilter) => void;
   onOpenCart: () => void;
+  onOpenMyOrders: () => void;
 }
 
 export function Header({
   activeRoute,
   activePlatform,
   cartCount,
+  savedOrdersCount,
   onNavigate,
   onSelectPlatform,
   onOpenCart,
+  onOpenMyOrders,
 }: HeaderProps) {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
@@ -42,16 +46,23 @@ export function Header({
   return (
     <header className="sticky top-0 z-40 bg-black text-white border-b border-neutral-800">
       <div className="max-w-[1200px] mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-8">
-        {/* Zone 1: Single text element wordmark */}
+        {/* Zone 1: Brand logo + wordmark */}
         <a
-          href="#home"
+          href="/"
           onClick={(e) => {
             e.preventDefault();
             handleLinkClick('home', 'all');
           }}
-          className="text-xl font-bold tracking-tight text-white hover:text-[#52c44c] transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-[#52c44c] focus-visible:outline-offset-4 rounded-sm"
+          className="inline-flex items-center gap-2.5 text-xl font-bold tracking-tight text-white hover:text-[#52c44c] transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-[#52c44c] focus-visible:outline-offset-4 rounded-sm"
         >
-          CyberGameStore
+          <img
+            src="/assets/aistudio/image_7c19fec9.png"
+            alt="CyberGameStore"
+            width={32}
+            height={32}
+            className="w-8 h-8 rounded-lg object-contain shrink-0"
+          />
+          <span>CyberGameStore</span>
         </a>
 
         {/* Zone 2: 5 concise single-line nav links */}
@@ -60,7 +71,7 @@ export function Header({
           className="hidden md:flex items-center gap-6 text-sm font-medium text-neutral-200"
         >
           <a
-            href="#xbox"
+            href="/xbox"
             onClick={(e) => {
               e.preventDefault();
               handleLinkClick('catalog', 'xbox');
@@ -72,7 +83,7 @@ export function Header({
             Игры Xbox
           </a>
           <a
-            href="#playstation"
+            href="/playstation"
             onClick={(e) => {
               e.preventDefault();
               handleLinkClick('catalog', 'ps');
@@ -84,7 +95,7 @@ export function Header({
             PlayStation
           </a>
           <a
-            href="#subscriptions"
+            href="/subscriptions"
             onClick={(e) => {
               e.preventDefault();
               handleLinkClick('catalog', 'subscriptions');
@@ -98,7 +109,7 @@ export function Header({
             Подписки
           </a>
           <a
-            href="#delivery"
+            href="/delivery"
             onClick={(e) => {
               e.preventDefault();
               handleLinkClick('delivery');
@@ -110,7 +121,7 @@ export function Header({
             Доставка
           </a>
           <a
-            href="#admin"
+            href="/admin"
             onClick={(e) => {
               e.preventDefault();
               handleLinkClick('admin');
@@ -123,8 +134,19 @@ export function Header({
           </a>
         </nav>
 
-        {/* Zone 3: 1 primary action */}
-        <div className="flex items-center gap-3 shrink-0">
+        {/* Zone 3: Actions */}
+        <div className="flex items-center gap-2.5 shrink-0">
+          {savedOrdersCount > 0 && (
+            <button
+              type="button"
+              onClick={onOpenMyOrders}
+              className="hidden sm:inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-neutral-100 bg-neutral-900 hover:bg-neutral-800 border border-neutral-700 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <Receipt className="w-3.5 h-3.5 text-[#52c44c]" />
+              <span className="tabular-nums">Мои покупки ({savedOrdersCount})</span>
+            </button>
+          )}
+
           <button
             type="button"
             onClick={onOpenCart}
@@ -193,6 +215,21 @@ export function Header({
             className="text-left px-3 py-2.5 text-sm font-medium text-neutral-100 rounded-lg hover:bg-neutral-900 cursor-pointer"
           >
             О магазине и документы
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setMobileMenuOpen(false);
+              onOpenMyOrders();
+            }}
+            className="text-left px-3 py-2.5 text-sm font-medium text-neutral-100 rounded-lg hover:bg-neutral-900 cursor-pointer flex items-center justify-between"
+          >
+            <span>Мои покупки</span>
+            {savedOrdersCount > 0 && (
+              <span className="font-mono text-xs text-[#52c44c] tabular-nums">
+                {savedOrdersCount}
+              </span>
+            )}
           </button>
           <button
             type="button"

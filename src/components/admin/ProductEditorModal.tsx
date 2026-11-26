@@ -394,14 +394,14 @@ export function ProductEditorModal({
                       src={form.image}
                       alt={form.title || 'Превью товара'}
                       title={form.title || 'Новый товар'}
-                      className="w-full h-full object-cover"
+                      className="w-full h-full"
                     />
                     {computedDiscount > 0 ? (
-                      <span className="absolute top-2.5 left-2.5 px-2.5 py-1 text-[11px] font-bold text-black bg-[#52c44c] rounded-md tabular-nums">
+                      <span className="absolute top-2.5 left-2.5 z-10 px-2.5 py-1 text-[11px] font-bold text-black bg-[#52c44c] rounded-md tabular-nums">
                         Скидка -{computedDiscount}%
                       </span>
                     ) : form.isPreorder ? (
-                      <span className="absolute top-2.5 left-2.5 px-2.5 py-1 text-[11px] font-bold text-white bg-black/85 border border-neutral-700 rounded-md">
+                      <span className="absolute top-2.5 left-2.5 z-10 px-2.5 py-1 text-[11px] font-bold text-white bg-black/85 border border-neutral-700 rounded-md">
                         Предзаказ
                       </span>
                     ) : null}
